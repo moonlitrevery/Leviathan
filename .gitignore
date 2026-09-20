@@ -1,0 +1,26 @@
+# Segredos
+.env
+
+# Banco de dados
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
