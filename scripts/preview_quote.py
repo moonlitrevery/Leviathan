@@ -16,10 +16,15 @@ from pathlib import Path
 RAIZ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAIZ))
 
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
 from PIL import Image, ImageDraw  # noqa: E402
 
 from leviathan.cogs.quotes import (  # noqa: E402
+    EMOJI_CACHE_DIR,
     LIMITE_CARACTERES,
+    refs_de,
     render_quote_card,
     truncar,
 )
@@ -53,6 +58,77 @@ ESTOURADO = LONGO + (
 )
 
 
+EMOJI_UNICODE = "Deu verde no CI 🎉 depois de 14 tentativas 😅 e um café ☕"
+
+# Sequência ZWJ (família) e modificador de tom de pele: o caso que quebra quem
+# segmenta emoji caractere a caractere.
+EMOJI_ZWJ = "Fim de semana com a família 👨‍👩‍👧‍👦 e o deploy pode esperar 👍🏽"
+
+# O primeiro id está no cache (semeado abaixo) e renderiza; o segundo não existe,
+# então cai para o texto :nome: em vez de virar quadrado.
+EMOJI_CUSTOM = (
+    "Reação obrigatória: <:leviathan:1111111111111111111> "
+    "e a que não baixou <:sumido:2222222222222222222>"
+)
+
+#: Id do emoji custom que o preview semeia no cache para exercitar o render.
+CUSTOM_SEMEADO = "1111111111111111111"
+
+
+def preparar_emojis_sync(texto: str) -> dict[str, bytes]:
+    """Versão síncrona do download de sprites, para rodar fora do bot.
+
+    Usa o mesmo ``refs_de`` e o mesmo cache em disco do cog, então o que aparece
+    aqui é o que vai aparecer no Discord.
+    """
+    imagens: dict[str, bytes] = {}
+    for chave, ref in refs_de(texto).items():
+        caminho = EMOJI_CACHE_DIR / f"{chave}.png"
+        if caminho.exists():
+            imagens[chave] = caminho.read_bytes()
+            continue
+        for url in ref.urls:
+            try:
+                with urllib.request.urlopen(url, timeout=20) as resposta:
+                    if resposta.status != 200:
+                        continue
+                    dados = resposta.read()
+            except (urllib.error.URLError, OSError):
+                continue
+            EMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            caminho.write_bytes(dados)
+            imagens[chave] = dados
+            break
+        else:
+            print(f"    sem sprite para {chave} -> cai para {ref.fallback!r}")
+    return imagens
+
+
+def semear_emoji_custom() -> None:
+    """Grava no cache um sprite para o emoji custom fictício do preview.
+
+    Um id inventado daria 404 no CDN do Discord. Semear o cache exercita o mesmo
+    caminho de render que um emoji real do servidor seguiria.
+    """
+    caminho = EMOJI_CACHE_DIR / f"c-{CUSTOM_SEMEADO}.png"
+    if caminho.exists():
+        return
+    sprite = Image.new("RGBA", (72, 72), (0, 0, 0, 0))
+    desenho = ImageDraw.Draw(sprite)
+    desenho.ellipse((2, 2, 69, 69), fill=(88, 101, 242, 255))
+    desenho.ellipse((20, 24, 32, 40), fill=(255, 255, 255, 255))
+    desenho.ellipse((40, 24, 52, 40), fill=(255, 255, 255, 255))
+    desenho.arc((18, 34, 54, 60), start=10, end=170, fill=(255, 255, 255, 255), width=6)
+    EMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    caminho.write_bytes(_png(sprite))
+
+
+def _png(imagem: Image.Image) -> bytes:
+    buffer = BytesIO()
+    imagem.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def avatar_falso() -> bytes:
     """Avatar sintético, para conferir o recorte circular sem depender da rede."""
     imagem = Image.new("RGB", (256, 256), (61, 90, 128))
@@ -67,6 +143,7 @@ def avatar_falso() -> bytes:
 def main() -> int:
     SAIDA.mkdir(exist_ok=True)
     avatar = avatar_falso()
+    semear_emoji_custom()
 
     casos = [
         ("1-curto", CURTO, avatar),
@@ -74,17 +151,22 @@ def main() -> int:
         ("3-longo-400", LONGO, avatar),
         ("4-estourado", ESTOURADO, avatar),
         ("5-sem-avatar", MEDIO, None),
+        ("6-emoji-unicode", EMOJI_UNICODE, avatar),
+        ("7-emoji-zwj", EMOJI_ZWJ, avatar),
+        ("8-emoji-custom", EMOJI_CUSTOM, avatar),
     ]
     assert len(LONGO) == 400, f"o caso do limite precisa ter 400 chars, tem {len(LONGO)}"
 
     print(f"limite de truncamento: {LIMITE_CARACTERES} caracteres\n")
     for nome, texto, bytes_avatar in casos:
+        emojis = preparar_emojis_sync(texto)
         png = render_quote_card(
             texto=texto,
             autor="João Vítor",
             data=DATA,
             canal="geral",
             avatar_bytes=bytes_avatar,
+            emoji_imagens=emojis,
         )
         destino = SAIDA / f"quote-{nome}.png"
         destino.write_bytes(png)
@@ -92,6 +174,7 @@ def main() -> int:
         truncado = len(texto) > LIMITE_CARACTERES
         print(
             f"{destino.name:26s} {len(texto):4d} chars"
+            f" | emoji: {len(emojis)}"
             f" | truncado: {'sim' if truncado else 'nao':3s}"
             f" | {len(png) / 1024:6.1f} KB"
         )

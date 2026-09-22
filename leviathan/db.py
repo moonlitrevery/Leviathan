@@ -184,6 +184,16 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX idx_quotes_guild_author ON quotes (guild_id, author_id)",
         ),
     ),
+    Migration(
+        version=7,
+        name="quote_card_posted",
+        statements=(
+            # A citação é gravada antes do card ser enviado, para reservar a mensagem.
+            # Sem esta coluna, um envio que falhasse deixaria a mensagem marcada como
+            # usada e ela nunca mais viraria card. Agora a reação seguinte retenta.
+            "ALTER TABLE quotes ADD COLUMN card_posted INTEGER NOT NULL DEFAULT 0",
+        ),
+    ),
 )
 
 

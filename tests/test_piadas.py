@@ -23,19 +23,17 @@ from leviathan.cogs.piadas import (
     counter_total,
     create_counter,
     delete_counter,
-    emoji_key,
     find_match,
     get_counter_by_emoji,
     get_counter_by_name,
     list_triggers,
-    normalize_unicode_emoji,
-    parse_emoji,
     record_hit,
     remove_trigger,
     seed_guild_triggers,
     upsert_trigger,
 )
 from leviathan.db import MIGRATIONS, Database, init_db
+from leviathan.emoji import emoji_key, normalize_unicode_emoji, parse_emoji
 
 GUILD = 111
 OUTRA_GUILD = 222

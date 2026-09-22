@@ -7,12 +7,18 @@ citação sobreviva à mensagem original ser apagada.
 A fonte é embarcada em ``leviathan/assets/fonts`` e carregada por caminho absoluto:
 o servidor de deploy não tem as fontes da máquina de desenvolvimento, e depender de
 fonte do sistema só quebraria lá.
+
+A Inter não tem glifos de emoji, então emoji não é desenhado como texto: o texto é
+segmentado em trechos e cada emoji vira uma imagem colada no lugar. Os PNGs são
+baixados **antes** do render (o render roda em ``asyncio.to_thread`` e não pode
+esperar rede) e ficam em cache no disco.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -20,13 +26,15 @@ from pathlib import Path
 
 import aiohttp
 import discord
+import emoji as emoji_lib
 from discord import app_commands
 from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from leviathan.bot import LeviathanBot
-from leviathan.cogs.piadas import emoji_key, get_counter_by_emoji, parse_emoji
+from leviathan.config import PROJECT_ROOT
 from leviathan.db import Database
+from leviathan.emoji import emoji_key, parse_emoji
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +64,156 @@ def _fonte(tamanho: int, peso: str = "Regular") -> ImageFont.FreeTypeFont:
     fonte = ImageFont.truetype(BytesIO(_FONT_BYTES), tamanho)
     fonte.set_variation_by_name(peso)
     return fonte
+
+
+# ---------------------------------------------------------------------------
+# Emoji: segmentação, sprites e cache
+# ---------------------------------------------------------------------------
+
+#: Fork mantido do Twemoji (o repositório original foi arquivado).
+TWEMOJI_URL = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/{nome}.png"
+DISCORD_EMOJI_URL = "https://cdn.discordapp.com/emojis/{ident}.png"
+
+#: PNGs baixados ficam aqui. data/ já é ignorado pelo git.
+EMOJI_CACHE_DIR = PROJECT_ROOT / "data" / "emoji_cache"
+
+CUSTOM_EMOJI_RE = re.compile(r"<(a?):(\w{1,32}):(\d{13,20})>")
+
+
+@dataclass(frozen=True, slots=True)
+class EmojiRef:
+    """Um emoji encontrado no texto e onde buscar a imagem dele."""
+
+    chave: str
+    fallback: str
+    urls: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Atomo:
+    """Pedaço indivisível de uma palavra: um trecho de texto ou um emoji."""
+
+    texto: str = ""
+    emoji: EmojiRef | None = None
+
+
+#: Uma palavra é uma sequência de átomos que não se separa na quebra de linha.
+Palavra = tuple[Atomo, ...]
+
+#: Sentinela de quebra de parágrafo, comparada por identidade.
+QUEBRA: Palavra = (Atomo(texto="\n"),)
+
+
+def _nomes_twemoji(sequencia: str) -> tuple[str, ...]:
+    """Nomes de arquivo candidatos no Twemoji, do mais provável ao menos.
+
+    O Twemoji nomeia pelos codepoints em hex separados por ``-`` e, na maioria dos
+    casos, **sem** o U+FE0F: ``2764.png`` existe e ``2764-fe0f.png`` não. Mas há
+    exceções, então tentamos as duas formas.
+    """
+    pontos = [f"{ord(c):x}" for c in sequencia]
+    sem_vs = [p for p in pontos if p != "fe0f"]
+    candidatos = []
+    if sem_vs:
+        candidatos.append("-".join(sem_vs))
+    candidatos.append("-".join(pontos))
+    return tuple(dict.fromkeys(candidatos))
+
+
+def _ref_unicode(sequencia: str) -> EmojiRef:
+    nome = emoji_lib.demojize(sequencia)
+    if not nome.isascii():  # sem correspondência na tabela: evita devolver tofu
+        nome = ":emoji:"
+    return EmojiRef(
+        chave="u-" + "-".join(f"{ord(c):x}" for c in sequencia),
+        fallback=nome,
+        urls=tuple(TWEMOJI_URL.format(nome=n) for n in _nomes_twemoji(sequencia)),
+    )
+
+
+def _spans(texto: str) -> list[tuple[int, int, EmojiRef]]:
+    """Posições de todos os emoji do texto, custom e unicode."""
+    spans: list[tuple[int, int, EmojiRef]] = []
+    for achado in CUSTOM_EMOJI_RE.finditer(texto):
+        _animado, nome, ident = achado.groups()
+        spans.append(
+            (
+                achado.start(),
+                achado.end(),
+                EmojiRef(
+                    chave=f"c-{ident}",
+                    fallback=f":{nome}:",
+                    urls=(DISCORD_EMOJI_URL.format(ident=ident),),
+                ),
+            )
+        )
+
+    ocupados = [(inicio, fim) for inicio, fim, _ in spans]
+    # emoji_list cuida das sequências ZWJ e dos modificadores de tom de pele.
+    for achado in emoji_lib.emoji_list(texto):
+        inicio, fim = achado["match_start"], achado["match_end"]
+        if any(inicio < f and i < fim for i, f in ocupados):
+            continue
+        spans.append((inicio, fim, _ref_unicode(achado["emoji"])))
+
+    spans.sort(key=lambda span: span[0])
+    return spans
+
+
+def segmentar(texto: str) -> list[Palavra]:
+    """Quebra o texto em palavras, cada uma feita de átomos de texto e de emoji."""
+    palavras: list[Palavra] = []
+    atual: list[Atomo] = []
+
+    def fechar() -> None:
+        nonlocal atual
+        if atual:
+            palavras.append(tuple(atual))
+            atual = []
+
+    def adicionar_texto(trecho: str) -> None:
+        for parte in re.split(r"(\s+)", trecho):
+            if not parte:
+                continue
+            if parte.isspace():
+                fechar()
+                for _ in range(parte.count("\n")):
+                    palavras.append(QUEBRA)
+            else:
+                atual.append(Atomo(texto=parte))
+
+    posicao = 0
+    for inicio, fim, ref in _spans(texto):
+        if inicio > posicao:
+            adicionar_texto(texto[posicao:inicio])
+        atual.append(Atomo(emoji=ref))
+        posicao = fim
+    if posicao < len(texto):
+        adicionar_texto(texto[posicao:])
+    fechar()
+    return palavras
+
+
+def refs_de(texto: str) -> dict[str, EmojiRef]:
+    """Emoji distintos do texto, prontos para serem baixados antes do render."""
+    return {ref.chave: ref for _, _, ref in _spans(texto)}
+
+
+def _decodificar(imagens: dict[str, bytes]) -> dict[str, Image.Image]:
+    """Converte os PNGs baixados em imagens.
+
+    Feito antes de medir: se um PNG não decodificar, a chave fica de fora e tanto a
+    medida quanto o desenho usam o texto ``:nome:``, sem descompasso entre os dois.
+    """
+    sprites: dict[str, Image.Image] = {}
+    for chave, dados in imagens.items():
+        try:
+            imagem = Image.open(BytesIO(dados))
+            imagem.load()
+            sprites[chave] = imagem.convert("RGBA")
+        except Exception:
+            log.warning("Sprite de emoji %s não pôde ser decodificado", chave)
+    return sprites
 
 
 # ---------------------------------------------------------------------------
@@ -111,67 +269,148 @@ def truncar(texto: str, limite: int = LIMITE_CARACTERES) -> str:
     return texto[:limite].rstrip() + "…"
 
 
-def _quebrar_palavra(palavra: str, fonte, largura_max: float) -> list[str]:
+def _largura_atomo(atomo: Atomo, fonte, tamanho: int, sprites) -> float:
+    if atomo.emoji is None:
+        return fonte.getlength(atomo.texto)
+    if atomo.emoji.chave in sprites:
+        # O emoji ocupa um quadrado do tamanho da fonte. Medir assim é o que impede
+        # o texto de vazar a margem quando o card tem emoji.
+        return float(tamanho)
+    return fonte.getlength(atomo.emoji.fallback)
+
+
+def _largura_palavra(palavra: Palavra, fonte, tamanho: int, sprites) -> float:
+    return sum(_largura_atomo(atomo, fonte, tamanho, sprites) for atomo in palavra)
+
+
+def _dividir_palavra(
+    palavra: Palavra, fonte, tamanho: int, largura_max: float, sprites
+) -> list[Palavra]:
     """Parte uma palavra que sozinha não cabe na linha (URL longa, por exemplo)."""
-    partes: list[str] = []
-    atual = ""
-    for caractere in palavra:
-        if not atual or fonte.getlength(atual + caractere) <= largura_max:
-            atual += caractere
-        else:
-            partes.append(atual)
-            atual = caractere
-    if atual:
-        partes.append(atual)
-    return partes
+    pedacos: list[Palavra] = []
+    atual: list[Atomo] = []
+    largura = 0.0
 
+    def empurrar(atomo: Atomo, quanto: float) -> None:
+        nonlocal atual, largura
+        if atual and largura + quanto > largura_max:
+            pedacos.append(tuple(atual))
+            atual = []
+            largura = 0.0
+        atual.append(atomo)
+        largura += quanto
 
-def quebrar_linhas(texto: str, fonte, largura_max: float) -> list[str]:
-    """Quebra automática por largura real do texto renderizado."""
-    linhas: list[str] = []
-    for paragrafo in texto.split("\n"):
-        if not paragrafo.strip():
-            linhas.append("")
+    for atomo in palavra:
+        if atomo.emoji is not None:
+            empurrar(atomo, _largura_atomo(atomo, fonte, tamanho, sprites))
             continue
-        atual = ""
-        for palavra in paragrafo.split():
-            if fonte.getlength(palavra) > largura_max:
-                if atual:
-                    linhas.append(atual)
-                    atual = ""
-                pedacos = _quebrar_palavra(palavra, fonte, largura_max)
-                linhas.extend(pedacos[:-1])
-                atual = pedacos[-1]
-                continue
-            candidata = f"{atual} {palavra}".strip()
-            if not atual or fonte.getlength(candidata) <= largura_max:
-                atual = candidata
-            else:
-                linhas.append(atual)
-                atual = palavra
-        if atual:
+        for caractere in atomo.texto:
+            empurrar(Atomo(texto=caractere), fonte.getlength(caractere))
+
+    if atual:
+        pedacos.append(tuple(atual))
+    return pedacos or [palavra]
+
+
+def quebrar_linhas(
+    palavras: list[Palavra], fonte, tamanho: int, largura_max: float, sprites
+) -> list[list[Palavra]]:
+    """Quebra automática por largura real, contando emoji como quadrado."""
+    linhas: list[list[Palavra]] = []
+    atual: list[Palavra] = []
+    largura = 0.0
+    espaco = fonte.getlength(" ")
+
+    for palavra in palavras:
+        if palavra is QUEBRA:
             linhas.append(atual)
+            atual = []
+            largura = 0.0
+            continue
+
+        propria = _largura_palavra(palavra, fonte, tamanho, sprites)
+        if propria > largura_max:
+            if atual:
+                linhas.append(atual)
+                atual = []
+                largura = 0.0
+            pedacos = _dividir_palavra(palavra, fonte, tamanho, largura_max, sprites)
+            for pedaco in pedacos[:-1]:
+                linhas.append([pedaco])
+            atual = [pedacos[-1]]
+            largura = _largura_palavra(pedacos[-1], fonte, tamanho, sprites)
+            continue
+
+        extra = propria if not atual else espaco + propria
+        if atual and largura + extra > largura_max:
+            linhas.append(atual)
+            atual = [palavra]
+            largura = propria
+        else:
+            atual.append(palavra)
+            largura += extra
+
+    if atual:
+        linhas.append(atual)
     return linhas
 
 
-def _ajustar_citacao(texto: str, largura_max: float, altura_max: float):
+def _ajustar_citacao(
+    palavras: list[Palavra], largura_max: float, altura_max: float, sprites
+):
     """Maior tamanho de fonte em que o texto ainda cabe no espaço disponível."""
     for tamanho in range(TAMANHO_MAX, TAMANHO_MIN - 1, -2):
         fonte = _fonte(tamanho, "Medium")
-        linhas = quebrar_linhas(texto, fonte, largura_max)
+        linhas = quebrar_linhas(palavras, fonte, tamanho, largura_max, sprites)
         altura_linha = round(tamanho * ALTURA_LINHA)
         if len(linhas) * altura_linha <= altura_max:
-            return fonte, linhas, altura_linha
+            return fonte, tamanho, linhas, altura_linha
 
     # Salvaguarda: no menor tamanho, corta o que não couber.
     fonte = _fonte(TAMANHO_MIN, "Medium")
     altura_linha = round(TAMANHO_MIN * ALTURA_LINHA)
-    linhas = quebrar_linhas(texto, fonte, largura_max)
+    linhas = quebrar_linhas(palavras, fonte, TAMANHO_MIN, largura_max, sprites)
     cabem = max(int(altura_max // altura_linha), 1)
     if len(linhas) > cabem:
         linhas = linhas[:cabem]
-        linhas[-1] = linhas[-1].rstrip() + "…"
-    return fonte, linhas, altura_linha
+        linhas[-1] = [*linhas[-1], (Atomo(texto="…"),)]
+    return fonte, TAMANHO_MIN, linhas, altura_linha
+
+
+def _desenhar_linha(
+    imagem: Image.Image,
+    desenho: ImageDraw.ImageDraw,
+    linha: list[Palavra],
+    x: float,
+    y: int,
+    fonte,
+    tamanho: int,
+    sprites,
+    ascent: int,
+) -> None:
+    espaco = fonte.getlength(" ")
+    cursor = float(x)
+    for indice, palavra in enumerate(linha):
+        if indice:
+            cursor += espaco
+        for atomo in palavra:
+            if atomo.emoji is None:
+                desenho.text((cursor, y), atomo.texto, font=fonte, fill=COR_CITACAO)
+                cursor += fonte.getlength(atomo.texto)
+                continue
+
+            sprite = sprites.get(atomo.emoji.chave)
+            if sprite is None:
+                desenho.text(
+                    (cursor, y), atomo.emoji.fallback, font=fonte, fill=COR_CITACAO
+                )
+                cursor += fonte.getlength(atomo.emoji.fallback)
+                continue
+
+            redimensionado = sprite.resize((tamanho, tamanho), Image.LANCZOS)
+            topo = y + round((ascent - tamanho) / 2)
+            imagem.paste(redimensionado, (round(cursor), topo), redimensionado)
+            cursor += tamanho
 
 
 def _avatar_circular(dados: bytes | None, tamanho: int) -> Image.Image:
@@ -208,9 +447,11 @@ def render_quote_card(
     data: datetime,
     canal: str,
     avatar_bytes: bytes | None = None,
+    emoji_imagens: dict[str, bytes] | None = None,
 ) -> bytes:
     """Gera o PNG do card. Bloqueante: chame via :func:`asyncio.to_thread`."""
     texto = truncar(texto)
+    sprites = _decodificar(emoji_imagens or {})
 
     imagem = Image.new("RGB", (LARGURA, ALTURA), FUNDO)
     desenho = ImageDraw.Draw(imagem)
@@ -230,15 +471,17 @@ def render_quote_card(
     disponivel = ALTURA - 2 * MARGEM
     altura_max_citacao = disponivel - bloco_autoria - GAP_CITACAO_AUTOR
 
-    fonte, linhas, altura_linha = _ajustar_citacao(
-        f"“{texto}”", largura_max, altura_max_citacao
+    palavras = segmentar(f"“{texto}”")
+    fonte, tamanho, linhas, altura_linha = _ajustar_citacao(
+        palavras, largura_max, altura_max_citacao, sprites
     )
+    ascent = fonte.getmetrics()[0]
 
     altura_total = len(linhas) * altura_linha + GAP_CITACAO_AUTOR + bloco_autoria
     y = (ALTURA - altura_total) // 2
 
     for linha in linhas:
-        desenho.text((x, y), linha, font=fonte, fill=COR_CITACAO)
+        _desenhar_linha(imagem, desenho, linha, x, y, fonte, tamanho, sprites, ascent)
         y += altura_linha
 
     y += GAP_CITACAO_AUTOR
@@ -278,6 +521,7 @@ class Quote:
     created_at: datetime
     jump_url: str
     saved_by: int
+    card_posted: bool
 
 
 async def get_quote_config(db: Database, guild_id: int) -> QuoteConfig | None:
@@ -323,12 +567,13 @@ def _quote_from_row(row) -> Quote:
         created_at=datetime.fromisoformat(row["created_at"]),
         jump_url=row["jump_url"],
         saved_by=row["saved_by"],
+        card_posted=bool(row["card_posted"]),
     )
 
 
 _QUOTE_COLUMNS = (
     "id, guild_id, message_id, channel_id, author_id, author_name,"
-    " content, created_at, jump_url, saved_by"
+    " content, created_at, jump_url, saved_by, card_posted"
 )
 
 
@@ -345,7 +590,7 @@ async def save_quote(
     jump_url: str,
     saved_by: int,
 ) -> bool:
-    """Salva a citação. Devolve ``False`` se a mensagem já tinha virado card.
+    """Salva a citação com ``card_posted = 0``. ``False`` se a mensagem já existia.
 
     O ``UNIQUE`` em ``message_id`` é o que garante "uma vez por mensagem": a
     segunda reação esbarra nele e o ``INSERT OR IGNORE`` vira no-op.
@@ -353,8 +598,8 @@ async def save_quote(
     afetadas = await db.execute(
         "INSERT OR IGNORE INTO quotes"
         " (guild_id, message_id, channel_id, author_id, author_name,"
-        "  content, created_at, jump_url, saved_by)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  content, created_at, jump_url, saved_by, card_posted)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         (
             guild_id,
             message_id,
@@ -368,6 +613,17 @@ async def save_quote(
         ),
     )
     return afetadas > 0
+
+
+async def get_quote_by_message(db: Database, message_id: int) -> Quote | None:
+    row = await db.fetchone(
+        f"SELECT {_QUOTE_COLUMNS} FROM quotes WHERE message_id = ?", (message_id,)
+    )
+    return _quote_from_row(row) if row else None
+
+
+async def mark_card_posted(db: Database, quote_id: int) -> None:
+    await db.execute("UPDATE quotes SET card_posted = 1 WHERE id = ?", (quote_id,))
 
 
 async def random_quote(
@@ -426,6 +682,8 @@ class Quotes(commands.Cog):
         self.bot = bot
         self.db = bot.db
         self._sessao: aiohttp.ClientSession | None = None
+        # Emoji que já falharam: evita repetir o download a cada card.
+        self._emoji_sem_sprite: set[str] = set()
 
     async def cog_load(self) -> None:
         self._sessao = aiohttp.ClientSession(
@@ -438,21 +696,62 @@ class Quotes(commands.Cog):
             await self._sessao.close()
             self._sessao = None
 
-    # -- avatar ------------------------------------------------------------
+    # -- download ----------------------------------------------------------
 
-    async def baixar_avatar(self, url: str) -> bytes | None:
-        """Baixa o avatar. Devolve ``None`` em qualquer falha: o card tem fallback."""
+    async def _baixar(self, url: str) -> bytes | None:
         if self._sessao is None:
             return None
         try:
             async with self._sessao.get(url) as resposta:
                 if resposta.status != 200:
-                    log.warning("Avatar %s devolveu HTTP %d", url, resposta.status)
                     return None
                 return await resposta.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            log.warning("Falha ao baixar o avatar %s: %s", url, exc)
+            log.warning("Falha ao baixar %s: %s", url, exc)
             return None
+
+    async def baixar_avatar(self, url: str) -> bytes | None:
+        """Baixa o avatar. Devolve ``None`` em qualquer falha: o card tem fallback."""
+        dados = await self._baixar(url)
+        if dados is None:
+            log.warning("Avatar %s indisponível, usando o círculo cinza", url)
+        return dados
+
+    async def obter_sprite(self, ref: EmojiRef) -> bytes | None:
+        """PNG do emoji, do cache em disco ou da rede."""
+        caminho = EMOJI_CACHE_DIR / f"{ref.chave}.png"
+        try:
+            return caminho.read_bytes()
+        except OSError:
+            pass
+
+        if ref.chave in self._emoji_sem_sprite:
+            return None
+
+        for url in ref.urls:
+            dados = await self._baixar(url)
+            if dados:
+                try:
+                    EMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    caminho.write_bytes(dados)
+                except OSError as exc:
+                    log.warning("Não consegui gravar o cache de %s: %s", ref.chave, exc)
+                return dados
+
+        self._emoji_sem_sprite.add(ref.chave)
+        log.info(
+            "Sem sprite para o emoji %s, o card vai mostrar %s", ref.chave, ref.fallback
+        )
+        return None
+
+    async def preparar_emojis(self, texto: str) -> dict[str, bytes]:
+        """Baixa os emoji do texto antes do render, que roda numa thread sem rede."""
+        imagens: dict[str, bytes] = {}
+        for chave, ref in refs_de(texto).items():
+            dados = await self.obter_sprite(ref)
+            if dados is not None:
+                imagens[chave] = dados
+        return imagens
 
     async def _avatar_de(self, guild: discord.Guild, author_id: int) -> bytes | None:
         membro = guild.get_member(author_id)
@@ -469,6 +768,7 @@ class Quotes(commands.Cog):
         canal: str,
         avatar_bytes: bytes | None,
     ) -> discord.File:
+        emoji_imagens = await self.preparar_emojis(texto)
         # Pillow é bloqueante: fora do event loop, senão trava o bot inteiro.
         png = await asyncio.to_thread(
             render_quote_card,
@@ -477,6 +777,7 @@ class Quotes(commands.Cog):
             data=data,
             canal=canal,
             avatar_bytes=avatar_bytes,
+            emoji_imagens=emoji_imagens,
         )
         return discord.File(BytesIO(png), filename="quote.png")
 
@@ -500,49 +801,77 @@ class Quotes(commands.Cog):
         if guild is None:
             return
 
+        existente = await get_quote_by_message(self.db, payload.message_id)
+        if existente is not None and existente.card_posted:
+            log.debug("Mensagem %s já virou card", payload.message_id)
+            return
+
         mensagem = await self._buscar_mensagem(payload.channel_id, payload.message_id)
         if mensagem is None or mensagem.author.bot:
             return
-        if not mensagem.content.strip():
+
+        # clean_content resolve <@id> para @Nome e <#id> para #canal. É o que vai
+        # para o banco também: o jogo de adivinhação lê dali e não pode vazar id.
+        conteudo = mensagem.clean_content
+        if not conteudo.strip():
             log.debug("Mensagem %s ignorada: sem texto", payload.message_id)
             return
 
-        autor = mensagem.author
-        nome = autor.display_name
-        novo = await save_quote(
-            self.db,
-            guild_id=payload.guild_id,
-            message_id=mensagem.id,
-            channel_id=mensagem.channel.id,
-            author_id=autor.id,
-            author_name=nome,
-            content=mensagem.content,
-            created_at=mensagem.created_at,
-            jump_url=mensagem.jump_url,
-            saved_by=payload.user_id,
-        )
-        if not novo:
-            log.debug("Mensagem %s já tinha virado card", mensagem.id)
-            return
+        if existente is None:
+            await save_quote(
+                self.db,
+                guild_id=payload.guild_id,
+                message_id=mensagem.id,
+                channel_id=mensagem.channel.id,
+                author_id=mensagem.author.id,
+                author_name=mensagem.author.display_name,
+                content=conteudo,
+                created_at=mensagem.created_at,
+                jump_url=mensagem.jump_url,
+                saved_by=payload.user_id,
+            )
+            existente = await get_quote_by_message(self.db, mensagem.id)
+            if existente is None:  # não deveria acontecer
+                log.error("Citação da mensagem %s sumiu logo após salvar", mensagem.id)
+                return
+        else:
+            log.info(
+                "Retentando o card da mensagem %s, que ficou com card_posted = 0",
+                mensagem.id,
+            )
 
         destino = guild.get_channel(config.channel_id)
         if not isinstance(destino, discord.abc.Messageable):
-            log.warning("Canal de quotes %d inacessível", config.channel_id)
+            log.warning(
+                "Canal de quotes %d inacessível; a citação %d fica pendente",
+                config.channel_id,
+                existente.id,
+            )
             return
 
-        avatar = await self.baixar_avatar(autor.display_avatar.replace(size=256).url)
-        nome_canal = getattr(mensagem.channel, "name", "desconhecido")
+        avatar = await self.baixar_avatar(
+            mensagem.author.display_avatar.replace(size=256).url
+        )
         try:
             arquivo = await self.gerar_card(
-                texto=mensagem.content,
-                autor=nome,
-                data=mensagem.created_at,
-                canal=nome_canal,
+                texto=existente.content,
+                autor=existente.author_name,
+                data=existente.created_at,
+                canal=getattr(mensagem.channel, "name", "desconhecido"),
                 avatar_bytes=avatar,
             )
             await destino.send(file=arquivo)
-        except (discord.HTTPException, OSError):
-            log.exception("Falha ao publicar o card da mensagem %s", mensagem.id)
+        except (discord.HTTPException, OSError, ValueError) as exc:
+            log.exception(
+                "Falha ao publicar o card da citação %d (mensagem %s): %s."
+                " Fica pendente e a próxima reação tenta de novo",
+                existente.id,
+                mensagem.id,
+                exc,
+            )
+            return
+
+        await mark_card_posted(self.db, existente.id)
 
     async def _buscar_mensagem(
         self, channel_id: int, message_id: int
@@ -561,6 +890,19 @@ class Quotes(commands.Cog):
             return None
 
     # -- comandos ----------------------------------------------------------
+
+    async def _contador_com_mesmo_emoji(self, guild_id: int, chave: str):
+        """Contador do cog piadas que usa este emoji, se o cog estiver disponível."""
+        try:
+            from leviathan.cogs.piadas import get_counter_by_emoji
+        except ImportError:
+            log.debug("Cog piadas indisponível: pulando a checagem de colisão de emoji")
+            return None
+        try:
+            return await get_counter_by_emoji(self.db, guild_id, chave)
+        except Exception:
+            log.warning("Não consegui checar colisão de emoji com os contadores")
+            return None
 
     @quote.command(name="config", description="Define o emoji e o canal das citações.")
     @app_commands.describe(
@@ -600,8 +942,7 @@ class Quotes(commands.Cog):
         linhas = [
             f"Citações configuradas: reaja com {parsed} e o card vai para {canal.mention}."
         ]
-        # O mesmo emoji alimentando um contador faria as duas coisas dispararem juntas.
-        colisao = await get_counter_by_emoji(self.db, interaction.guild_id, chave)
+        colisao = await self._contador_com_mesmo_emoji(interaction.guild_id, chave)
         if colisao is not None:
             linhas.append(
                 f"⚠️ Atenção: {parsed} já alimenta o contador **{colisao.name}**. "
@@ -642,13 +983,12 @@ class Quotes(commands.Cog):
 
         avatar = await self._avatar_de(interaction.guild, citacao.author_id)
         canal = interaction.guild.get_channel(citacao.channel_id)
-        nome_canal = getattr(canal, "name", "desconhecido")
 
         arquivo = await self.gerar_card(
             texto=citacao.content,
             autor=citacao.author_name,
             data=citacao.created_at,
-            canal=nome_canal,
+            canal=getattr(canal, "name", "desconhecido"),
             avatar_bytes=avatar,
         )
         await interaction.followup.send(file=arquivo)

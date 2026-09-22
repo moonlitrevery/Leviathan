@@ -20,6 +20,7 @@ from discord.ext import commands
 
 from leviathan.bot import LeviathanBot
 from leviathan.db import Database
+from leviathan.emoji import emoji_key, normalize_unicode_emoji, parse_emoji
 
 log = logging.getLogger(__name__)
 
@@ -49,10 +50,6 @@ TOP_N_PLACAR = 3
 RANK_LIMIT = 25
 
 MEDALHAS = ("🥇", "🥈", "🥉")
-
-#: Caracteres invisíveis que variam conforme o cliente que enviou a reação.
-VARIATION_SELECTOR = "️"
-ZERO_WIDTH_JOINER = "‍"
 
 
 # ---------------------------------------------------------------------------
@@ -187,52 +184,6 @@ class Counter:
     emoji_display: str
     scoreboard_channel_id: int
     scoreboard_message_id: int | None
-
-
-def normalize_unicode_emoji(raw: str) -> str:
-    """Forma canônica de um emoji unicode.
-
-    O mesmo emoji chega de jeitos diferentes conforme o cliente que reagiu: com ou
-    sem o variation selector (U+FE0F), e às vezes com um ZWJ (U+200D) sobrando no
-    fim. Sem isso, ``❤️`` gravado na criação do contador nunca casaria com o ``❤``
-    que chega na reação, e o incremento seria descartado em silêncio.
-    """
-    return raw.replace(VARIATION_SELECTOR, "").rstrip(ZERO_WIDTH_JOINER)
-
-
-def emoji_key(emoji: discord.PartialEmoji | discord.Emoji | str) -> str:
-    """Chave estável de um emoji.
-
-    Emoji custom vira ``custom:<id>``, que sobrevive a renomear o emoji no servidor;
-    emoji unicode é a sequência de caracteres já normalizada.
-    """
-    if isinstance(emoji, str):
-        emoji = discord.PartialEmoji.from_str(emoji)
-    if emoji.id is not None:
-        return f"custom:{emoji.id}"
-    return normalize_unicode_emoji(emoji.name or "")
-
-
-def parse_emoji(valor: str) -> discord.PartialEmoji | None:
-    """Interpreta o que o usuário digitou como emoji, ou ``None`` se não for um.
-
-    O emoji unicode volta já normalizado, para que a criação do contador grave
-    exatamente a mesma forma que :func:`emoji_key` produz na leitura da reação.
-    """
-    valor = valor.strip()
-    if not valor:
-        return None
-
-    emoji = discord.PartialEmoji.from_str(valor)
-    if emoji.id is not None:
-        return emoji
-
-    # Sem id é unicode: exigimos ao menos um caractere fora do ASCII, senão qualquer
-    # palavra digitada por engano viraria um "emoji" válido.
-    nome = normalize_unicode_emoji(emoji.name or "")
-    if not nome or nome.isascii() or len(nome) > 16:
-        return None
-    return discord.PartialEmoji(name=nome)
 
 
 def _counter_from_row(row) -> Counter:

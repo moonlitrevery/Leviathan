@@ -13,6 +13,7 @@ leviathan/
   bot.py          # subclasse de commands.Bot, setup_hook, handler global de erro
   config.py       # leitura e validação do .env
   db.py           # pool aiosqlite + init_db() com migrations versionadas
+  emoji.py        # normalização de emoji, compartilhada entre cogs
   cogs/
     core.py       # /ping e /reload
     piadas.py     # gatilhos de texto e contadores por reação
@@ -26,6 +27,7 @@ scripts/
   preview_quote.py  # gera previews do card sem subir o bot
 tests/
   test_piadas.py  # deduplicação dos contadores e casamento dos gatilhos
+  test_quotes.py  # segmentação de emoji e medição do card
 ```
 
 ## Pré-requisitos
@@ -120,6 +122,38 @@ a data e o canal.
 Pillow é bloqueante, então a renderização roda em `asyncio.to_thread` — sem isso, cada
 card travaria o event loop do bot inteiro.
 
+O texto salvo é o `clean_content` da mensagem: `<@123>` já vira `@Nome` e `<#456>` vira
+`#canal`. É essa forma que vai para o banco, então o jogo de adivinhação futuro lê dali
+sem risco de vazar o ID de ninguém.
+
+**Emoji.** A Inter não tem glifos de emoji, então emoji não é desenhado como texto —
+viraria quadrado. O texto é segmentado (com a biblioteca `emoji`, que resolve sequências
+ZWJ como 👨‍👩‍👧‍👦 e modificadores de tom de pele como 👍🏽) e cada emoji vira uma imagem colada
+no lugar:
+
+- **Unicode:** PNG do [Twemoji](https://github.com/jdecked/twemoji) via jsDelivr. O nome
+  do arquivo são os codepoints em hex separados por `-` e, quase sempre, **sem** o
+  U+FE0F — `2764.png` existe e `2764-fe0f.png` dá 404 — mas há exceções, então as duas
+  formas são tentadas nessa ordem.
+- **Custom do Discord:** `cdn.discordapp.com/emojis/<id>.png`, tanto para `<:nome:id>`
+  quanto para `<a:nome:id>`.
+- **Cache** em `data/emoji_cache/` (ignorado pelo git), para não rebaixar o mesmo emoji.
+- **Se o download falhar**, o card mostra `:nome:` em texto, nunca um quadrado.
+
+Os downloads acontecem **antes** do render, de forma assíncrona; a thread do Pillow
+recebe os bytes prontos e não toca na rede. A quebra de linha e o auto-shrink medem o
+emoji como um quadrado do tamanho da fonte (ou como a largura do `:nome:`, quando o
+sprite não veio) — sem isso o texto vazaria a margem.
+
+> O `pilmoji` foi avaliado e **não funciona com o Pillow 12**: ele passa uma tupla onde
+> o `ImageText` novo espera um objeto de fonte (`AttributeError: 'tuple' object has no
+> attribute 'getbbox'`). Daí a implementação própria.
+
+**Card perdido.** A citação é gravada antes do envio, para reservar a mensagem. Se o
+envio falhar, a linha fica com `card_posted = 0` e o log registra o motivo; a próxima
+reação naquela mensagem tenta publicar de novo, em vez de a mensagem ficar marcada como
+usada e nunca virar card.
+
 **A fonte é embarcada em `leviathan/assets/fonts/Inter.ttf`** (Inter, licença SIL OFL,
 incluída em `OFL.txt`) e carregada por caminho absoluto relativo ao pacote. Isso é
 proposital: o servidor de deploy não tem as fontes da máquina de desenvolvimento, e
@@ -136,9 +170,11 @@ mudar, veja `FUSO_EXIBICAO` em [quotes.py](leviathan/cogs/quotes.py).
 uv run python scripts/preview_quote.py
 ```
 
-Gera cinco cards em `preview/` (pasta ignorada pelo git) — texto curto, médio, um de
-exatamente 400 caracteres, um acima do limite para ver o corte, e um sem avatar para
-ver o fallback. Use depois de mexer nas constantes de layout no topo de `quotes.py`.
+Gera oito cards em `preview/` (pasta ignorada pelo git): texto curto, médio, um de
+exatamente 400 caracteres, um acima do limite para ver o corte, um sem avatar para ver o
+fallback do círculo cinza, e três com emoji — unicode, sequência ZWJ com tom de pele, e
+custom do Discord (um que renderiza e um que cai para `:nome:`). Use depois de mexer nas
+constantes de layout no topo de `quotes.py`.
 
 ## Links úteis (`/pirata` e `/sistema`)
 
