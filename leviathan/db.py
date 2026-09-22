@@ -59,6 +59,131 @@ MIGRATIONS: tuple[Migration, ...] = (
         name="baseline",
         statements=(),  # fundação: apenas marca o banco como inicializado
     ),
+    Migration(
+        version=2,
+        name="triggers",
+        statements=(
+            """
+            CREATE TABLE triggers (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER NOT NULL,
+                word       TEXT    NOT NULL,
+                url        TEXT    NOT NULL,
+                substring  INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            "CREATE UNIQUE INDEX idx_triggers_guild_word ON triggers (guild_id, word)",
+            # guild_id = 0 significa "vale em qualquer servidor"; um gatilho com o
+            # mesmo word e guild_id real sobrescreve o global naquele servidor.
+            "INSERT INTO triggers (guild_id, word, url, substring)"
+            " VALUES (0, 'papoi', 'https://images-ext-1.discordapp.net/external/_XGgaht0Vl3PgL3NoYcKew_088_Ww1VVyyDBKVRJjss/%3Furl%3Dhttps%3A%2F%2Fvideo.twimg.com%2Ftweet_video%2FHRsnGnAaoAA3a5S.mp4/https/gifconvert.vxtwitter.com/convert.avif?animated=true&format=webp', 0)",
+        ),
+    ),
+    Migration(
+        version=3,
+        name="counters",
+        statements=(
+            """
+            CREATE TABLE counters (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id              INTEGER NOT NULL,
+                name                  TEXT    NOT NULL,
+                emoji_key             TEXT    NOT NULL,
+                emoji_display         TEXT    NOT NULL,
+                scoreboard_channel_id INTEGER NOT NULL,
+                scoreboard_message_id INTEGER,
+                created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            "CREATE UNIQUE INDEX idx_counters_guild_name"
+            " ON counters (guild_id, name COLLATE NOCASE)",
+            "CREATE UNIQUE INDEX idx_counters_guild_emoji ON counters (guild_id, emoji_key)",
+            # A chave primária é a deduplicação: a mesma pessoa reagindo com o mesmo
+            # emoji na mesma mensagem nunca conta duas vezes, mesmo que remova a
+            # reação e reaja de novo (nada é apagado daqui em on_raw_reaction_remove).
+            """
+            CREATE TABLE counter_hits (
+                counter_id INTEGER NOT NULL REFERENCES counters (id) ON DELETE CASCADE,
+                message_id INTEGER NOT NULL,
+                reactor_id INTEGER NOT NULL,
+                target_id  INTEGER NOT NULL,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (counter_id, message_id, reactor_id)
+            )
+            """,
+            "CREATE INDEX idx_counter_hits_target ON counter_hits (counter_id, target_id)",
+        ),
+    ),
+    Migration(
+        version=4,
+        name="normalize_emoji_keys",
+        statements=(
+            # char(65039) = U+FE0F (variation selector), char(8205) = U+200D (ZWJ).
+            # Dependendo do cliente, a mesma reação chega com ou sem esses caracteres;
+            # sem normalizar, a chave gravada na criação não casa com a da reação.
+            # A cláusula NOT EXISTS pula linhas cuja normalização colidiria com outro
+            # contador da mesma guild, que faria o índice único abortar o boot.
+            """
+            UPDATE counters
+               SET emoji_key = RTRIM(REPLACE(emoji_key, char(65039), ''), char(8205))
+             WHERE emoji_key NOT LIKE 'custom:%'
+               AND emoji_key <> RTRIM(REPLACE(emoji_key, char(65039), ''), char(8205))
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM counters AS outro
+                      WHERE outro.guild_id = counters.guild_id
+                        AND outro.id <> counters.id
+                        AND outro.emoji_key =
+                            RTRIM(REPLACE(counters.emoji_key, char(65039), ''), char(8205))
+                   )
+            """,
+        ),
+    ),
+    Migration(
+        version=5,
+        name="drop_global_triggers",
+        statements=(
+            # O conceito de gatilho global (guild_id = 0) foi removido: ele fazia
+            # /gatilho remove apagar o gatilho de outras guilds junto. O seed passou
+            # a ser aplicado por guild no on_ready, então as linhas antigas só somem.
+            "DELETE FROM triggers WHERE guild_id = 0",
+        ),
+    ),
+    Migration(
+        version=6,
+        name="quotes",
+        statements=(
+            """
+            CREATE TABLE quote_config (
+                guild_id      INTEGER PRIMARY KEY,
+                emoji_key     TEXT    NOT NULL,
+                emoji_display TEXT    NOT NULL,
+                channel_id    INTEGER NOT NULL,
+                updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            # content e author_name ficam gravados de propósito: a citação precisa
+            # sobreviver à mensagem original ser apagada, porque um jogo de
+            # adivinhação vai ler esta tabela depois.
+            """
+            CREATE TABLE quotes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL UNIQUE,
+                channel_id  INTEGER NOT NULL,
+                author_id   INTEGER NOT NULL,
+                author_name TEXT    NOT NULL,
+                content     TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL,
+                jump_url    TEXT    NOT NULL,
+                saved_by    INTEGER NOT NULL,
+                saved_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            "CREATE INDEX idx_quotes_guild_author ON quotes (guild_id, author_id)",
+        ),
+    ),
 )
 
 
@@ -195,14 +320,26 @@ async def init_db(database: Database, migrations: Sequence[Migration] = MIGRATIO
         return current
 
     for migration in pending:
+        afetadas = 0
         async with database.transaction() as conn:
             for statement in migration.statements:
-                await conn.execute(statement)
+                cursor = await conn.execute(statement)
+                # DDL devolve rowcount -1; só interessa o que mexeu em linhas.
+                afetadas += max(cursor.rowcount, 0)
+                await cursor.close()
             await conn.execute(
                 "INSERT INTO schema_version (version, name) VALUES (?, ?)",
                 (migration.version, migration.name),
             )
-        log.info("Migration %d (%s) aplicada", migration.version, migration.name)
+        if afetadas:
+            log.warning(
+                "Migration %d (%s) aplicada, %d linha(s) de dados alterada(s)",
+                migration.version,
+                migration.name,
+                afetadas,
+            )
+        else:
+            log.info("Migration %d (%s) aplicada", migration.version, migration.name)
 
     current = max(applied | {m.version for m in pending})
     log.info("Schema do banco na versão %d", current)

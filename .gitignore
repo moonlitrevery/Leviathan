@@ -1,8 +1,8 @@
 # Segredos
 .env
 
-# Banco de dados
-data/
+# Banco de dados (só o data/ da raiz: leviathan/data/ é versionado)
+/data/
 *.db
 *.db-wal
 *.db-shm
@@ -24,3 +24,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Previews de imagem gerados localmente
+preview/

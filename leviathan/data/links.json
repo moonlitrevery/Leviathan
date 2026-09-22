@@ -1,0 +1,263 @@
+{
+  "_nota": "Edite este arquivo e rode /reload links no Discord. Chaves iniciadas com _ sao ignoradas pelo loader. As URLs precisam comecar com http:// ou https://. Os itens de video apontam para buscas no YouTube de proposito: troque pelo video especifico que voce preferir.",
+
+  "pirata": {
+    "titulo": "Guias de pirataria",
+    "descricao": "Os dois pontos de partida da comunidade: a megathread do r/Piracy e o FMHY.",
+    "cor": "#8e44ad",
+    "itens": [
+      {
+        "nome": "r/Piracy — Megathread",
+        "url": "https://www.reddit.com/r/Piracy/wiki/megathread/",
+        "descricao": "A lista canônica do subreddit, mantida pela moderação."
+      },
+      {
+        "nome": "r/Piracy — subreddit",
+        "url": "https://www.reddit.com/r/Piracy/",
+        "descricao": "Discussões, notícias e avisos sobre sites que caíram."
+      },
+      {
+        "nome": "FMHY — página inicial",
+        "url": "https://fmhy.net/",
+        "descricao": "O maior índice de recursos gratuitos, sucessor da megathread."
+      },
+      {
+        "nome": "FMHY — guia para iniciantes",
+        "url": "https://fmhy.net/beginners-guide",
+        "descricao": "Por onde começar, incluindo o básico de segurança."
+      },
+      {
+        "nome": "FMHY — vídeo",
+        "url": "https://fmhy.net/videopiracyguide",
+        "descricao": "Filmes, séries e streaming."
+      },
+      {
+        "nome": "FMHY — áudio",
+        "url": "https://fmhy.net/audiopiracyguide",
+        "descricao": "Música, podcasts e audiolivros."
+      },
+      {
+        "nome": "FMHY — jogos",
+        "url": "https://fmhy.net/gamingpiracyguide",
+        "descricao": "Jogos, emuladores e ferramentas."
+      },
+      {
+        "nome": "FMHY — leitura",
+        "url": "https://fmhy.net/readingpiracyguide",
+        "descricao": "Livros, quadrinhos, mangás e artigos."
+      },
+      {
+        "nome": "FMHY — downloads",
+        "url": "https://fmhy.net/downloadpiracyguide",
+        "descricao": "Torrent, DDL e gerenciadores de download."
+      },
+      {
+        "nome": "FMHY — adblock e VPN",
+        "url": "https://fmhy.net/adblockvpnguide",
+        "descricao": "Bloqueio de anúncios, privacidade e VPNs."
+      },
+      {
+        "nome": "FMHY — sites não confiáveis",
+        "url": "https://fmhy.net/unsafesites",
+        "descricao": "Lista do que evitar. Vale conferir antes de abrir link estranho."
+      },
+      {
+        "nome": "FMHY no GitHub",
+        "url": "https://github.com/fmhy/FMHY",
+        "descricao": "Espelho do wiki, útil quando o site está fora do ar."
+      }
+    ]
+  },
+
+  "sistema": {
+    "titulo": "Sistemas disponíveis",
+    "descricao": "Escolha um sistema para ver documentação, guia de instalação e vídeo tutorial.",
+    "cor": "#3498db",
+    "opcoes": {
+      "arch": {
+        "nome": "Arch Linux",
+        "titulo": "Arch Linux",
+        "descricao": "Rolling release, instalação manual. A ArchWiki é referência mesmo para quem usa outra distro.",
+        "cor": "#1793d1",
+        "itens": [
+          {
+            "nome": "Documentação oficial (ArchWiki)",
+            "url": "https://wiki.archlinux.org/",
+            "descricao": "A melhor documentação de Linux que existe."
+          },
+          {
+            "nome": "Guia de instalação",
+            "url": "https://wiki.archlinux.org/title/Installation_guide",
+            "descricao": "O passo a passo oficial, do particionamento ao bootloader."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=arch+linux+installation+guide+2025",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "cachyos": {
+        "nome": "CachyOS",
+        "titulo": "CachyOS",
+        "descricao": "Baseado em Arch, com instalador gráfico e pacotes otimizados para CPUs modernas.",
+        "cor": "#3ba55d",
+        "itens": [
+          {
+            "nome": "Documentação oficial (wiki)",
+            "url": "https://wiki.cachyos.org/",
+            "descricao": "Wiki oficial do projeto."
+          },
+          {
+            "nome": "Download e instalação",
+            "url": "https://cachyos.org/download/",
+            "descricao": "ISOs e instruções de gravação da mídia."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=cachyos+install+guide",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "windows": {
+        "nome": "Windows",
+        "titulo": "Windows",
+        "descricao": "Instalação limpa e criação de mídia de boot.",
+        "cor": "#0078d4",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://support.microsoft.com/windows",
+            "descricao": "Central de suporte da Microsoft."
+          },
+          {
+            "nome": "Baixar e instalar (mídia de instalação)",
+            "url": "https://www.microsoft.com/software-download/windows11",
+            "descricao": "Media Creation Tool e ISO oficial."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=formatar+e+instalar+windows+11+passo+a+passo",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "ubuntu": {
+        "nome": "Ubuntu",
+        "titulo": "Ubuntu",
+        "descricao": "A distro mais comum para quem está começando no Linux.",
+        "cor": "#e95420",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://help.ubuntu.com/",
+            "descricao": "Documentação e guias oficiais."
+          },
+          {
+            "nome": "Guia de instalação (desktop)",
+            "url": "https://ubuntu.com/tutorials/install-ubuntu-desktop",
+            "descricao": "Tutorial oficial, da mídia USB ao primeiro boot."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=como+instalar+ubuntu+passo+a+passo",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "fedora": {
+        "nome": "Fedora",
+        "titulo": "Fedora",
+        "descricao": "Pacotes novos e boa integração com GNOME, mantido pela Red Hat.",
+        "cor": "#51a2da",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://docs.fedoraproject.org/en-US/docs/",
+            "descricao": "Documentação do projeto Fedora."
+          },
+          {
+            "nome": "Guia de instalação",
+            "url": "https://docs.fedoraproject.org/en-US/fedora/latest/install-guide/",
+            "descricao": "Install Guide oficial da versão atual."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=fedora+workstation+install+guide",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "debian": {
+        "nome": "Debian",
+        "titulo": "Debian",
+        "descricao": "Estabilidade acima de tudo. Base de Ubuntu, Mint e muitas outras.",
+        "cor": "#a80030",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://www.debian.org/doc/",
+            "descricao": "Manuais, FAQ e wiki."
+          },
+          {
+            "nome": "Manual de instalação",
+            "url": "https://www.debian.org/releases/stable/installmanual",
+            "descricao": "Manual completo da versão estável."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=debian+install+guide",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "mint": {
+        "nome": "Linux Mint",
+        "titulo": "Linux Mint",
+        "descricao": "Desktop familiar para quem vem do Windows, baseado em Ubuntu.",
+        "cor": "#87cf3e",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://linuxmint.com/documentation.php",
+            "descricao": "Manuais oficiais do projeto."
+          },
+          {
+            "nome": "Guia de instalação",
+            "url": "https://linuxmint-installation-guide.readthedocs.io/",
+            "descricao": "Installation Guide oficial, em formato web."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=como+instalar+linux+mint+passo+a+passo",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      },
+      "popos": {
+        "nome": "Pop!_OS",
+        "titulo": "Pop!_OS",
+        "descricao": "Da System76, com boa saída da caixa para NVIDIA e para jogos.",
+        "cor": "#48b9c7",
+        "itens": [
+          {
+            "nome": "Documentação oficial",
+            "url": "https://support.system76.com/",
+            "descricao": "Base de conhecimento da System76."
+          },
+          {
+            "nome": "Guia de instalação",
+            "url": "https://support.system76.com/articles/install-pop/",
+            "descricao": "Passo a passo oficial de instalação."
+          },
+          {
+            "nome": "Vídeo tutorial",
+            "url": "https://www.youtube.com/results?search_query=pop+os+install+guide",
+            "descricao": "Busca no YouTube — troque pelo vídeo que você preferir."
+          }
+        ]
+      }
+    }
+  }
+}
