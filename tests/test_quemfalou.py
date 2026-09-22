@@ -1,8 +1,13 @@
 """Testes da lógica pura do jogo "quem falou?".
 
-Fora do alcance daqui: sorteio do histórico e publicação da rodada, que dependem
-do Discord. O que está coberto é o que decide sozinho — quais mensagens podem
-virar rodada, quando o bot fica calado, e a regra de um palpite por pessoa.
+Fora do alcance daqui: a leitura do histórico e a publicação da rodada, que
+dependem do Discord. O que está coberto é o que decide sozinho — quais mensagens
+podem virar rodada, quais canais e citações são sorteáveis, quando o bot fica
+calado, a regra de um palpite por pessoa e quando o agendador entende que o jogo
+ainda tem gente.
+
+Os canais e a guild aqui são dublês: ``canais_sorteaveis`` e ``escolher_citacao``
+só leem permissões e ids, então dá para exercitá-los sem subir nada do Discord.
 """
 
 from __future__ import annotations
@@ -14,10 +19,14 @@ import pytest
 from leviathan.cogs.quemfalou import (
     MIN_CARACTERES,
     MIN_PALAVRAS,
+    QuemFalou,
     contar_palpites,
     criar_rodada,
     data_aproximada,
     dentro_do_silencio,
+    escolher_citacao,
+    houve_movimento,
+    houve_palpite_na_ultima_rodada,
     marcar_acerto,
     mensagem_elegivel,
     registrar_palpite,
@@ -31,6 +40,11 @@ CANAL_QUALQUER = 222
 AUTOR = 333
 ANA = 1001
 BRUNO = 1002
+
+CANAL_PUBLICO = 201
+CANAL_PRIVADO = 202
+CANAL_EXCLUIDO = 203
+CANAL_SUMIDO = 204
 
 FRASE = "essa frase tem tamanho suficiente para virar rodada"
 
@@ -277,3 +291,232 @@ async def test_so_um_acerto_encerra_a_rodada(db, rodada):
     """Dois acertos simultâneos disputam o mesmo UPDATE condicional."""
     assert await marcar_acerto(db, rodada.id, ANA) is True
     assert await marcar_acerto(db, rodada.id, BRUNO) is False, "a rodada já não está ativa"
+
+
+# ---------------------------------------------------------------------------
+# Privacidade: canais sorteáveis e fonte "citações"
+# ---------------------------------------------------------------------------
+
+EVERYONE = object()
+EU = object()
+
+
+class FakePermissoes:
+    def __init__(self, pode: bool) -> None:
+        self.view_channel = pode
+        self.read_message_history = pode
+
+
+class FakeCanal:
+    """Canal com permissões fixas para o @everyone e para o bot."""
+
+    def __init__(self, id: int, *, publico: bool = True, bot_le: bool = True) -> None:
+        self.id = id
+        self.name = f"canal-{id}"
+        self._publico = publico
+        self._bot_le = bot_le
+
+    def permissions_for(self, alvo):
+        return FakePermissoes(self._publico if alvo is EVERYONE else self._bot_le)
+
+
+class FakeGuild:
+    def __init__(self, canais) -> None:
+        self.id = GUILD
+        self.default_role = EVERYONE
+        self.me = EU
+        self.text_channels = list(canais)
+
+
+def canais_permitidos(canais, *, excluidos=frozenset()) -> set[int]:
+    """Os ids que o jogo aceita sortear, pela mesma função que o cog usa."""
+    sorteaveis = QuemFalou.canais_sorteaveis(
+        None,
+        FakeGuild(canais),
+        excluidos=set(excluidos),
+        canal_do_jogo=CANAL_JOGO,
+    )
+    return {canal.id for canal in sorteaveis}
+
+
+def citacao(message_id: int, channel_id: int, *, autor: int = AUTOR, texto: str = FRASE):
+    return {
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "author_id": autor,
+        "content": texto,
+        "created_at": "2025-03-10T00:00:00+00:00",
+        "jump_url": "https://discord.com/x",
+    }
+
+
+def escolher(citacoes, *, permitidos, usadas=frozenset(), no_servidor=(AUTOR,)):
+    return escolher_citacao(
+        citacoes,
+        usadas=set(usadas),
+        canais_permitidos=permitidos,
+        autor_no_servidor=lambda autor: autor in no_servidor,
+    )
+
+
+def test_canal_privado_fica_fora_dos_sorteaveis():
+    publico = FakeCanal(CANAL_PUBLICO)
+    privado = FakeCanal(CANAL_PRIVADO, publico=False)
+
+    assert canais_permitidos([publico, privado]) == {CANAL_PUBLICO}
+
+
+def test_canal_que_o_bot_nao_le_fica_fora():
+    assert canais_permitidos([FakeCanal(CANAL_PUBLICO, bot_le=False)]) == set()
+
+
+def test_canal_do_jogo_fica_fora():
+    assert canais_permitidos([FakeCanal(CANAL_JOGO)]) == set()
+
+
+def test_citacao_de_canal_privado_nunca_e_escolhida():
+    """Mesmo sendo a única citação disponível, ela não pode vazar."""
+    permitidos = canais_permitidos(
+        [FakeCanal(CANAL_PUBLICO), FakeCanal(CANAL_PRIVADO, publico=False)]
+    )
+
+    assert escolher([citacao(1, CANAL_PRIVADO)], permitidos=permitidos) is None
+
+
+def test_citacao_de_canal_excluido_nunca_e_escolhida():
+    permitidos = canais_permitidos(
+        [FakeCanal(CANAL_PUBLICO), FakeCanal(CANAL_EXCLUIDO)],
+        excluidos={CANAL_EXCLUIDO},
+    )
+
+    assert escolher([citacao(1, CANAL_EXCLUIDO)], permitidos=permitidos) is None
+
+
+def test_citacao_de_canal_que_nao_existe_mais_e_descartada():
+    permitidos = canais_permitidos([FakeCanal(CANAL_PUBLICO)])
+
+    assert escolher([citacao(1, CANAL_SUMIDO)], permitidos=permitidos) is None
+
+
+def test_citacao_de_canal_publico_e_escolhida():
+    permitidos = canais_permitidos([FakeCanal(CANAL_PUBLICO)])
+
+    escolhida = escolher([citacao(1, CANAL_PUBLICO)], permitidos=permitidos)
+
+    assert escolhida is not None and escolhida["message_id"] == 1
+
+
+def test_percorre_a_amostra_ate_achar_uma_que_passe_em_tudo():
+    """Uma citação reprovada não pode fazer a rodada inteira desistir."""
+    permitidos = canais_permitidos(
+        [FakeCanal(CANAL_PUBLICO), FakeCanal(CANAL_PRIVADO, publico=False)]
+    )
+    amostra = [
+        citacao(1, CANAL_PUBLICO),  # já usada
+        citacao(2, CANAL_PRIVADO),  # canal restrito
+        citacao(3, CANAL_SUMIDO),  # canal que sumiu
+        citacao(4, CANAL_PUBLICO, autor=BRUNO),  # autor saiu do servidor
+        citacao(5, CANAL_PUBLICO, texto="curta"),  # texto inelegível
+        citacao(6, CANAL_PUBLICO),  # esta serve
+    ]
+
+    escolhida = escolher(amostra, permitidos=permitidos, usadas={1})
+
+    assert escolhida is not None and escolhida["message_id"] == 6
+
+
+def test_amostra_toda_reprovada_devolve_nada():
+    permitidos = canais_permitidos([FakeCanal(CANAL_PUBLICO)])
+    amostra = [citacao(1, CANAL_PRIVADO), citacao(2, CANAL_EXCLUIDO)]
+
+    assert escolher(amostra, permitidos=permitidos) is None
+
+
+# ---------------------------------------------------------------------------
+# Movimento: palpite conta tanto quanto mensagem
+# ---------------------------------------------------------------------------
+
+
+class Espiao:
+    """Callable assíncrono que registra se chegou a ser chamado."""
+
+    def __init__(self, resposta: bool) -> None:
+        self.resposta = resposta
+        self.chamado = False
+
+    async def __call__(self) -> bool:
+        self.chamado = True
+        return self.resposta
+
+
+ONTEM = datetime(2025, 3, 10, tzinfo=timezone.utc)
+
+
+async def test_sem_rodada_anterior_sempre_ha_movimento():
+    palpite, mensagem = Espiao(False), Espiao(False)
+
+    assert await houve_movimento(None, tem_palpite=palpite, tem_mensagem=mensagem) is True
+    assert not palpite.chamado and not mensagem.chamado
+
+
+async def test_palpite_conta_como_movimento():
+    """Num canal dedicado, as pessoas jogam pelo select sem escrever nada."""
+    palpite, mensagem = Espiao(True), Espiao(False)
+
+    assert await houve_movimento(ONTEM, tem_palpite=palpite, tem_mensagem=mensagem) is True
+
+
+async def test_historico_nao_e_lido_quando_ja_houve_palpite():
+    """Consulta ao banco primeiro; a chamada à API só se precisar."""
+    palpite, mensagem = Espiao(True), Espiao(True)
+
+    await houve_movimento(ONTEM, tem_palpite=palpite, tem_mensagem=mensagem)
+
+    assert palpite.chamado and not mensagem.chamado
+
+
+async def test_sem_palpite_o_historico_decide():
+    palpite, mensagem = Espiao(False), Espiao(True)
+
+    assert await houve_movimento(ONTEM, tem_palpite=palpite, tem_mensagem=mensagem) is True
+    assert mensagem.chamado
+
+
+async def test_sem_palpite_e_sem_mensagem_nao_ha_movimento():
+    palpite, mensagem = Espiao(False), Espiao(False)
+
+    assert await houve_movimento(ONTEM, tem_palpite=palpite, tem_mensagem=mensagem) is False
+
+
+async def test_rodada_sem_palpite_nao_conta_como_movimento(db, rodada):
+    assert await houve_palpite_na_ultima_rodada(db, GUILD) is False
+
+
+async def test_palpite_na_ultima_rodada_e_encontrado(db, rodada):
+    await registrar_palpite(db, rodada.id, ANA, BRUNO, False)
+
+    assert await houve_palpite_na_ultima_rodada(db, GUILD) is True
+
+
+async def test_palpite_de_rodada_antiga_nao_vale(db, rodada):
+    """Só a rodada mais recente diz se o jogo ainda tem gente."""
+    await registrar_palpite(db, rodada.id, ANA, BRUNO, False)
+    nova = await criar_rodada(
+        db,
+        guild_id=GUILD,
+        game_channel_id=CANAL_JOGO,
+        origem_channel_id=CANAL_QUALQUER,
+        origem_message_id=557,
+        autor_id=AUTOR,
+        conteudo=FRASE,
+        origem_criada_em=datetime(2025, 5, 1, tzinfo=timezone.utc),
+        jump_url="https://discord.com/z",
+        expira_em=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    assert nova is not None
+
+    assert await houve_palpite_na_ultima_rodada(db, GUILD) is False
+
+
+async def test_guild_sem_rodada_nenhuma_nao_tem_palpite(db):
+    assert await houve_palpite_na_ultima_rodada(db, 42) is False

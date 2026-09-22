@@ -17,6 +17,7 @@ import asyncio
 import logging
 import random
 import re
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -134,6 +135,28 @@ def data_aproximada(quando: datetime) -> str:
         quando = quando.replace(tzinfo=timezone.utc)
     local = quando.astimezone(FUSO)
     return f"{MESES[local.month - 1]} de {local.year}"
+
+
+async def houve_movimento(
+    ultima_rodada: datetime | None,
+    *,
+    tem_palpite: Callable[[], Awaitable[bool]],
+    tem_mensagem: Callable[[], Awaitable[bool]],
+) -> bool:
+    """Se o jogo deu sinal de vida desde a última rodada.
+
+    Palpitar é uma interação com o select, não uma mensagem: num canal dedicado
+    ao jogo as pessoas jogam sem escrever nada, e olhar só o histórico faria o
+    agendador nunca mais disparar. Por isso o palpite conta como movimento.
+
+    O palpite é checado primeiro porque é só uma consulta ao banco; o histórico
+    do canal, que custa uma chamada à API, só é lido se não houver palpite.
+    """
+    if ultima_rodada is None:
+        return True
+    if await tem_palpite():
+        return True
+    return await tem_mensagem()
 
 
 def agora_utc() -> datetime:
@@ -376,6 +399,17 @@ async def contar_palpites(db: Database, rodada_id: int) -> tuple[int, int]:
     return int(row["total"] or 0), int(row["errados"] or 0)
 
 
+async def houve_palpite_na_ultima_rodada(db: Database, guild_id: int) -> bool:
+    """Se alguém palpitou na rodada mais recente da guild."""
+    row = await db.fetchone(
+        "SELECT 1 FROM quemfalou_palpites WHERE rodada_id ="
+        " (SELECT id FROM quemfalou_rodadas WHERE guild_id = ? ORDER BY id DESC LIMIT 1)"
+        " LIMIT 1",
+        (guild_id,),
+    )
+    return row is not None
+
+
 async def marcar_acerto(db: Database, rodada_id: int, vencedor_id: int) -> bool:
     """Fecha a rodada como acertada. ``False`` se outra pessoa chegou primeiro.
 
@@ -429,19 +463,52 @@ async def placar(db: Database, guild_id: int, limite: int) -> list[tuple[int, in
     ]
 
 
-async def citacao_aleatoria(
-    db: Database, guild_id: int, usadas: set[int]
-) -> dict[str, Any] | None:
-    """Sorteia da tabela ``quotes``, que já guarda o ``clean_content``."""
+#: Tamanho da amostra sorteada da tabela ``quotes``.
+AMOSTRA_CITACOES = 50
+
+
+async def citacoes_sorteadas(
+    db: Database, guild_id: int, limite: int = AMOSTRA_CITACOES
+) -> list[dict[str, Any]]:
+    """Amostra da tabela ``quotes``, que já guarda o ``clean_content``.
+
+    Devolve a amostra inteira em vez de uma citação só: os filtros rodam depois,
+    e desistir na primeira reprovada jogaria fora as outras quarenta e nove.
+    """
     rows = await db.fetchall(
         "SELECT message_id, channel_id, author_id, content, created_at, jump_url"
-        " FROM quotes WHERE guild_id = ? ORDER BY RANDOM() LIMIT 50",
-        (guild_id,),
+        " FROM quotes WHERE guild_id = ? ORDER BY RANDOM() LIMIT ?",
+        (guild_id, limite),
     )
-    for row in rows:
-        if row["message_id"] in usadas:
+    return [dict(row) for row in rows]
+
+
+def escolher_citacao(
+    citacoes: Iterable[dict[str, Any]],
+    *,
+    usadas: set[int],
+    canais_permitidos: set[int],
+    autor_no_servidor: Callable[[int], bool],
+) -> dict[str, Any] | None:
+    """Primeira citação da amostra que passa em TODOS os filtros.
+
+    A tabela ``quotes`` guarda citação de qualquer canal e não sabe nada de
+    privacidade: alguém pode ter fixado uma mensagem de canal restrito. Por isso
+    ``canais_permitidos`` — o resultado de :meth:`QuemFalou.canais_sorteaveis` —
+    vale aqui igualzinho ao sorteio do histórico. Citação de canal privado, de
+    canal excluído, do próprio canal do jogo ou de canal que nem existe mais
+    simplesmente não está nesse conjunto.
+    """
+    for citacao in citacoes:
+        if citacao["message_id"] in usadas:
             continue
-        return dict(row)
+        if citacao["channel_id"] not in canais_permitidos:
+            continue
+        if not autor_no_servidor(citacao["author_id"]):
+            continue
+        if not texto_elegivel(citacao["content"]):
+            continue
+        return citacao
     return None
 
 
@@ -610,14 +677,21 @@ class QuemFalou(commands.Cog):
         return await self._canal_teve_movimento(config)
 
     async def _canal_teve_movimento(self, config: Config) -> bool:
-        """Se alguém humano falou no canal do jogo desde a última rodada.
+        """Se houve palpite na última rodada ou mensagem humana no canal.
 
         Sem isso, um servidor parado receberia rodada atrás de rodada sem ninguém
-        para jogar.
+        para jogar. A checagem em si está em :func:`houve_movimento`, que também
+        garante a ordem: banco primeiro, API só se necessário.
         """
-        if config.ultima_rodada is None:
-            return True
+        return await houve_movimento(
+            config.ultima_rodada,
+            tem_palpite=lambda: houve_palpite_na_ultima_rodada(self.db, config.guild_id),
+            tem_mensagem=lambda: self._mensagem_humana_no_canal(config),
+        )
 
+    async def _mensagem_humana_no_canal(self, config: Config) -> bool:
+        """Se alguém humano falou no canal do jogo desde a última rodada."""
+        assert config.ultima_rodada is not None
         canal = self.bot.get_channel(config.channel_id)
         if not isinstance(canal, discord.TextChannel):
             return False
@@ -658,12 +732,12 @@ class QuemFalou(commands.Cog):
         return elegiveis
 
     async def sortear_do_historico(
-        self, guild: discord.Guild, config: Config, usadas: set[int]
+        self,
+        guild: discord.Guild,
+        config: Config,
+        usadas: set[int],
+        canais: list[discord.TextChannel],
     ) -> discord.Message | None:
-        excluidos = await canais_excluidos(self.db, guild.id)
-        canais = self.canais_sorteaveis(
-            guild, excluidos=excluidos, canal_do_jogo=config.channel_id
-        )
         if not canais:
             log.info("Guild %d não tem canal público sorteável", guild.id)
             return None
@@ -709,18 +783,25 @@ class QuemFalou(commands.Cog):
     ) -> dict[str, Any] | None:
         """Escolhe a mensagem da rodada conforme a fonte configurada."""
         usadas = await mensagens_usadas(self.db, guild.id)
+        excluidos = await canais_excluidos(self.db, guild.id)
+        # A mesma barreira de privacidade para as duas fontes.
+        canais = self.canais_sorteaveis(
+            guild, excluidos=excluidos, canal_do_jogo=config.channel_id
+        )
+        permitidos = {canal.id for canal in canais}
 
         fontes = ["citacoes", "historico"] if config.fonte == "ambos" else [config.fonte]
         random.shuffle(fontes)
 
         for fonte in fontes:
             if fonte == "citacoes":
-                citacao = await citacao_aleatoria(self.db, guild.id, usadas)
+                citacao = escolher_citacao(
+                    await citacoes_sorteadas(self.db, guild.id),
+                    usadas=usadas,
+                    canais_permitidos=permitidos,
+                    autor_no_servidor=lambda autor: guild.get_member(autor) is not None,
+                )
                 if citacao is None:
-                    continue
-                if guild.get_member(citacao["author_id"]) is None:
-                    continue
-                if not texto_elegivel(citacao["content"]):
                     continue
                 return {
                     "origem_channel_id": citacao["channel_id"],
@@ -731,7 +812,7 @@ class QuemFalou(commands.Cog):
                     "jump_url": citacao["jump_url"],
                 }
 
-            mensagem = await self.sortear_do_historico(guild, config, usadas)
+            mensagem = await self.sortear_do_historico(guild, config, usadas, canais)
             if mensagem is not None:
                 return {
                     "origem_channel_id": mensagem.channel.id,
