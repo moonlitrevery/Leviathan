@@ -32,6 +32,8 @@ COR = discord.Color.from_str("#d51007")
 #: A Last.fm devolve esta imagem de estrela quando a faixa não tem capa.
 PLACEHOLDER_HASH = "2a96cbd8b46e442fc41c2b86b821562f"
 
+MENSAGEM_INSTAVEL = "A Last.fm está instável no momento. Tente de novo em instantes."
+
 #: Janela do cache em memória, por (método, parâmetros).
 CACHE_TTL = 30.0
 
@@ -117,9 +119,7 @@ def _traduzir_erro(codigo: int, mensagem: str) -> LastfmError:
             "A chave da API da Last.fm foi recusada. Confira o LASTFM_API_KEY no .env."
         )
     if codigo in (8, 11, 16):
-        return LastfmIndisponivel(
-            "A Last.fm está instável no momento. Tente de novo em instantes."
-        )
+        return LastfmIndisponivel(MENSAGEM_INSTAVEL)
     log.warning("Erro não mapeado da Last.fm: %s — %s", codigo, mensagem)
     return LastfmIndisponivel(f"A Last.fm recusou a consulta ({codigo}).")
 
@@ -194,7 +194,17 @@ class LastfmClient:
                     )
                 # Erros da Last.fm vêm com status 400 e corpo JSON, então o corpo é
                 # lido antes de julgar o status.
-                dados = await resposta.json(content_type=None)
+                try:
+                    dados = await resposta.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError) as exc:
+                    # Em 502/503 o proxy devolve HTML, e o parse estoura um
+                    # ValueError que subiria como erro interno do comando.
+                    log.warning(
+                        "Corpo não-JSON da Last.fm em %s (HTTP %d)",
+                        metodo,
+                        resposta.status,
+                    )
+                    raise LastfmIndisponivel(MENSAGEM_INSTAVEL) from exc
         except asyncio.TimeoutError as exc:
             raise LastfmIndisponivel(
                 "A Last.fm demorou demais para responder. Tente de novo em instantes."

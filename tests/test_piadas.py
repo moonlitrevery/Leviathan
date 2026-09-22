@@ -521,7 +521,7 @@ def test_prune_cooldowns_descarta_entradas_vencidas(db):
 
     cog._cooldowns[(1, 1)] = agora - piadas.COOLDOWN_TTL_SECONDS - 60  # vencida
     cog._cooldowns[(2, 2)] = agora  # recente
-    cog._last_cooldown_prune = 0.0  # força a limpeza nesta chamada
+    cog._last_cooldown_prune = piadas.SEM_REGISTRO  # como num cog recém-criado
 
     cog._prune_cooldowns(agora)
 
@@ -538,6 +538,104 @@ def test_prune_cooldowns_nao_roda_a_cada_mensagem(db):
     cog._prune_cooldowns(agora)
 
     assert (1, 1) in cog._cooldowns, "a poda é periódica, não a cada acesso"
+
+
+# ---------------------------------------------------------------------------
+# Sentinela de tempo: monotonic conta desde o boot, não desde 1970
+# ---------------------------------------------------------------------------
+
+
+class _CanalFake:
+    def __init__(self, ident: int) -> None:
+        self.id = ident
+
+
+class _GuildFake:
+    def __init__(self, ident: int) -> None:
+        self.id = ident
+
+
+class _AutorFake:
+    bot = False
+
+
+class _MensagemFake:
+    """O mínimo que o ``on_message`` do cog toca numa mensagem."""
+
+    def __init__(self, conteudo: str, *, canal: int = CANAL) -> None:
+        self.content = conteudo
+        self.author = _AutorFake()
+        self.guild = _GuildFake(GUILD)
+        self.channel = _CanalFake(canal)
+        self.respostas: list[str] = []
+
+    async def reply(self, conteudo: str, *, mention_author: bool = True) -> None:
+        self.respostas.append(conteudo)
+
+
+def test_cooldown_nao_engole_o_primeiro_gatilho_apos_o_boot(db):
+    """Numa VPS recém-reiniciada, ``monotonic()`` vale poucos segundos.
+
+    Com a sentinela antiga (``0.0``), ``agora - 0.0`` caía dentro da janela de 30s
+    e a primeira resposta era descartada como se já tivesse acontecido.
+    """
+    cog = Piadas(_BotFake(db))
+    agora = 5.0  # máquina ligada há 5 segundos
+
+    assert cog._cooldown_ativo((1, 1), agora) is False, "nunca respondeu: pode responder"
+
+    cog._cooldowns[(1, 1)] = agora
+    assert cog._cooldown_ativo((1, 1), agora + 1.0) is True
+    assert cog._cooldown_ativo((1, 1), agora + piadas.TRIGGER_COOLDOWN_SECONDS) is False
+
+
+def test_poda_roda_mesmo_com_monotonic_pequeno(db):
+    cog = Piadas(_BotFake(db))
+    agora = 5.0
+
+    cog._cooldowns[(1, 1)] = agora - piadas.COOLDOWN_TTL_SECONDS - 60  # vencida
+    cog._cooldowns[(2, 2)] = agora  # recente
+
+    cog._prune_cooldowns(agora)
+
+    assert (1, 1) not in cog._cooldowns, "a poda precisa rodar já na primeira mensagem"
+    assert (2, 2) in cog._cooldowns
+
+
+async def test_gatilho_responde_logo_apos_o_boot(db, monkeypatch):
+    """O caminho inteiro do on_message, com o relógio recém-zerado."""
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    await upsert_trigger(db, GUILD, "papoi", "https://exemplo.com/papoi", False)
+
+    cog = Piadas(_BotFake(db))
+    mensagem = _MensagemFake("olha o papoi ali")
+    await cog.on_message(mensagem)
+
+    assert mensagem.respostas == ["https://exemplo.com/papoi"]
+
+
+async def test_cooldown_continua_valendo_apos_a_primeira_resposta(db, monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    await upsert_trigger(db, GUILD, "papoi", "https://exemplo.com/papoi", False)
+
+    cog = Piadas(_BotFake(db))
+    await cog.on_message(_MensagemFake("papoi"))
+    segunda = _MensagemFake("papoi de novo")
+    await cog.on_message(segunda)
+
+    assert segunda.respostas == [], "o segundo no mesmo canal cai no cooldown"
+
+
+async def test_cooldown_e_por_canal(db, monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    await upsert_trigger(db, GUILD, "papoi", "https://exemplo.com/papoi", False)
+
+    cog = Piadas(_BotFake(db))
+    await cog.on_message(_MensagemFake("papoi", canal=CANAL))
+    outro_canal = _MensagemFake("papoi", canal=CANAL + 1)
+    await cog.on_message(outro_canal)
+
+    assert outro_canal.respostas == ["https://exemplo.com/papoi"]
 
 
 def _trigger(word: str, *, substring: bool, id_: int = 1):

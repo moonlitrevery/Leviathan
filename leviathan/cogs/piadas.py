@@ -42,6 +42,14 @@ TRIGGER_COOLDOWN_SECONDS = 30.0
 #: Idade a partir da qual uma entrada de cooldown já não serve para nada.
 COOLDOWN_TTL_SECONDS = 300.0
 
+#: "Nunca aconteceu", para comparações contra ``time.monotonic()``.
+#:
+#: Não pode ser ``0.0``: monotonic conta desde o boot da máquina, não desde 1970.
+#: Numa VPS recém-reiniciada ``monotonic()`` vale poucos segundos, e ``agora - 0.0``
+#: cairia dentro de qualquer janela — o primeiro gatilho seria engolido pelo
+#: cooldown e a poda não rodaria nos primeiros minutos.
+SEM_REGISTRO = float("-inf")
+
 #: Espera antes de publicar o placar, para agrupar rajadas de reações.
 SCOREBOARD_DEBOUNCE_SECONDS = 3.0
 
@@ -345,7 +353,7 @@ class Piadas(commands.Cog):
         self._triggers: dict[int, list[Trigger]] = {}
         # (channel_id, trigger_id) -> instante da última resposta. Podado por idade.
         self._cooldowns: dict[tuple[int, int], float] = {}
-        self._last_cooldown_prune = 0.0
+        self._last_cooldown_prune = SEM_REGISTRO
         # Um lock por contador para que reações simultâneas não briguem pelo placar.
         # Dict simples (não defaultdict) para não criar lock por id inexistente.
         self._scoreboard_locks: dict[int, asyncio.Lock] = {}
@@ -409,6 +417,11 @@ class Piadas(commands.Cog):
             chave: quando for chave, quando in self._cooldowns.items() if quando > limite
         }
 
+    def _cooldown_ativo(self, chave: tuple[int, int], agora: float) -> bool:
+        """Se este gatilho já respondeu neste canal dentro da janela."""
+        ultimo = self._cooldowns.get(chave, SEM_REGISTRO)
+        return agora - ultimo < TRIGGER_COOLDOWN_SECONDS
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None or not message.content:
@@ -426,7 +439,7 @@ class Piadas(commands.Cog):
         self._prune_cooldowns(agora)
 
         chave = (message.channel.id, acertou.id)
-        if agora - self._cooldowns.get(chave, 0.0) < TRIGGER_COOLDOWN_SECONDS:
+        if self._cooldown_ativo(chave, agora):
             return
         self._cooldowns[chave] = agora
 
