@@ -681,28 +681,19 @@ class Quotes(commands.Cog):
     def __init__(self, bot: LeviathanBot) -> None:
         self.bot = bot
         self.db = bot.db
-        self._sessao: aiohttp.ClientSession | None = None
         # Emoji que já falharam: evita repetir o download a cada card.
         self._emoji_sem_sprite: set[str] = set()
-
-    async def cog_load(self) -> None:
-        self._sessao = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            headers={"User-Agent": "LeviathanBot/0.1 (quote cards)"},
-        )
-
-    async def cog_unload(self) -> None:
-        if self._sessao is not None:
-            await self._sessao.close()
-            self._sessao = None
 
     # -- download ----------------------------------------------------------
 
     async def _baixar(self, url: str) -> bytes | None:
-        if self._sessao is None:
+        # Sessão compartilhada do bot: aberta no setup_hook, fechada no close().
+        sessao = self.bot.http_session
+        if sessao is None:
+            log.warning("Sessão HTTP do bot indisponível; sem download de %s", url)
             return None
         try:
-            async with self._sessao.get(url) as resposta:
+            async with sessao.get(url) as resposta:
                 if resposta.status != 200:
                     return None
                 return await resposta.read()

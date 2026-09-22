@@ -30,6 +30,8 @@ class Config:
     discord_token: str
     guild_id: int
     database_path: Path
+    #: Opcional: sem ela o cog lastfm não carrega e o resto do bot sobe normal.
+    lastfm_api_key: str | None
 
     @classmethod
     def load(cls, *, env_file: Path | None = None) -> "Config":
@@ -74,6 +76,9 @@ class Config:
         if not database_path.is_absolute():
             database_path = PROJECT_ROOT / database_path
 
+        # Opcional de propósito: quem não usa Last.fm não precisa de chave.
+        lastfm_api_key = os.getenv("LASTFM_API_KEY", "").strip() or None
+
         if problems:
             raise ConfigError(_format_problems(problems))
 
@@ -81,6 +86,7 @@ class Config:
             discord_token=token,
             guild_id=guild_id,
             database_path=database_path,
+            lastfm_api_key=lastfm_api_key,
         )
 
 

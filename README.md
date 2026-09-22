@@ -19,6 +19,7 @@ leviathan/
     piadas.py     # gatilhos de texto e contadores por reação
     links.py      # /pirata e /sistema, lidos do JSON
     quotes.py     # cards de citação em imagem (Pillow)
+    lastfm.py     # /fm: tocando, recentes, top e compatibilidade
   data/
     links.json    # conteúdo dos comandos de links (versionado, editável)
   assets/
@@ -28,6 +29,7 @@ scripts/
 tests/
   test_piadas.py  # deduplicação dos contadores e casamento dos gatilhos
   test_quotes.py  # segmentação de emoji e medição do card
+  test_lastfm.py  # cálculo de compatibilidade musical
 ```
 
 ## Pré-requisitos
@@ -69,6 +71,7 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `DISCORD_TOKEN` | sim | Token do bot (aba Bot > Reset Token) |
 | `GUILD_ID` | sim | ID do servidor de desenvolvimento onde os comandos são sincronizados |
 | `DATABASE_PATH` | não | Caminho do SQLite; padrão `data/leviathan.db` |
+| `LASTFM_API_KEY` | não | Chave da [API da Last.fm](https://www.last.fm/api/account/create). Sem ela, só os comandos `/fm` ficam de fora |
 
 ## Comandos
 
@@ -89,6 +92,62 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `/quote random` | todos | Reposta o card de uma citação salva ao acaso |
 | `/quote de <membro>` | todos | Citação ao acaso daquela pessoa |
 | `/quote count` | todos | Total de citações e top 5 de quem mais foi citado |
+| `/fm vincular <usuario>` | todos | Liga seu Discord a um perfil da Last.fm |
+| `/fm desvincular` | todos | Remove o vínculo |
+| `/fm tocando [membro]` | todos | O que está tocando agora, ou a última faixa |
+| `/fm recentes [membro]` | todos | Últimas 10 faixas, com horário relativo |
+| `/fm top [membro] [tipo] [periodo]` | todos | Top 10 de artistas, músicas ou álbuns |
+| `/fm compat <membro1> [membro2]` | todos | Compatibilidade musical entre duas pessoas |
+
+## Last.fm (`/fm`)
+
+Precisa de `LASTFM_API_KEY` no `.env`. **Sem a chave, só este cog fica de fora** — o
+`setup` levanta `CogUnavailable` e o boot registra um aviso de uma linha, sem traceback:
+
+```
+WARNING leviathan.bot: Cog leviathan.cogs.lastfm não carregado: LASTFM_API_KEY não
+está definida no .env, então os comandos /fm ficam fora.
+```
+
+Cada pessoa vincula a própria conta com `/fm vincular <usuário>`, que **valida o perfil
+via `user.getInfo` antes de gravar** — um nome errado viraria um erro confuso só no
+primeiro `/fm tocando`. O vínculo é por pessoa do Discord, não por servidor.
+
+Nos comandos de consulta, `membro` é opcional e o padrão é quem chamou. As respostas
+são públicas; só os avisos (conta não vinculada, erro de API) são efêmeros, para não
+poluir o canal.
+
+### Compatibilidade musical
+
+A API de tasteometer da Last.fm não existe mais, então `/fm compat` faz a conta aqui:
+pega o top 50 artistas de cada pessoa em "sempre" e calcula uma **interseção de
+histogramas** — cada artista vira uma fatia do total de plays da pessoa, e a
+compatibilidade é a soma das menores fatias entre as duas.
+
+Ponderar por plays evita que um artista ouvido uma vez conte o mesmo que o favorito, e
+normalizar pelo total deixa a conta justa entre quem tem 50 mil scrobbles e quem tem
+500. Duas listas iguais dão 100%, listas sem interseção dão 0%. Os testes em
+[tests/test_lastfm.py](tests/test_lastfm.py) travam essas propriedades.
+
+### Detalhes de API
+
+- **Cache em memória de 30s** por (método, parâmetros): vários comandos seguidos não
+  martelam a Last.fm.
+- **Timeout de 10s**; erro de rede vira mensagem amigável, não traceback.
+- **Perfil privado** (erro 17) e **usuário inexistente** (erro 6) têm mensagem própria,
+  a primeira apontando para `last.fm/settings/privacy`.
+- A Last.fm devolve uma **imagem placeholder de estrela** quando a faixa não tem capa
+  (hash `2a96cbd8b46e442fc41c2b86b821562f`). Nesse caso o embed sai sem thumbnail.
+
+## Sessão HTTP compartilhada
+
+O bot mantém **uma** `aiohttp.ClientSession` em `bot.http_session`, aberta no
+`setup_hook` e fechada no `close()`. Todo cog que fala com API externa usa ela — hoje o
+`quotes` (avatares e sprites de emoji) e o `lastfm`. Abrir uma sessão por cog
+desperdiçaria pool de conexões e espalharia o shutdown por vários lugares.
+
+Cogs novos devem usar `self.bot.http_session`, tratando o caso de ela ser `None`
+(antes do `setup_hook`, ou em testes).
 
 ## Cards de citação (`/quote`)
 

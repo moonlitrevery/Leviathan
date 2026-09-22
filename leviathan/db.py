@@ -194,6 +194,21 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE quotes ADD COLUMN card_posted INTEGER NOT NULL DEFAULT 0",
         ),
     ),
+    Migration(
+        version=8,
+        name="lastfm_users",
+        statements=(
+            # O vínculo é por pessoa do Discord, não por servidor: o bot roda em
+            # um servidor só e quem vinculou não deveria ter que repetir isso.
+            """
+            CREATE TABLE lastfm_users (
+                discord_id INTEGER PRIMARY KEY,
+                username   TEXT    NOT NULL,
+                linked_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+        ),
+    ),
 )
 
 

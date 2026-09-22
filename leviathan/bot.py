@@ -6,10 +6,12 @@ import logging
 import traceback
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from leviathan import __version__
 from leviathan.config import Config
 from leviathan.db import Database, init_db
 
@@ -20,6 +22,19 @@ COGS_DIR = Path(__file__).resolve().parent / "cogs"
 
 #: Prefixo de import dos cogs (``leviathan.cogs.core``, por exemplo).
 COGS_PACKAGE = "leviathan.cogs"
+
+#: Teto das chamadas HTTP dos cogs. Uma API lenta não pode segurar o bot.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+USER_AGENT = f"LeviathanBot/{__version__} (+https://github.com/moonlitrevery/Leviathan)"
+
+
+class CogUnavailable(Exception):
+    """Cog que não pode operar neste ambiente — falta de config ou de asset.
+
+    Não é defeito: quem levanta isso no ``setup`` do cog vira um aviso de uma
+    linha no log, sem traceback, e os outros cogs seguem carregando.
+    """
 
 
 def discover_cogs() -> list[str]:
@@ -54,6 +69,9 @@ class LeviathanBot(commands.Bot):
 
         self.config = config
         self.db = Database(config.database_path)
+        # Sessão HTTP única, compartilhada por todos os cogs que falam com APIs.
+        # Abrir uma por cog desperdiçaria pool de conexões e complicaria o shutdown.
+        self.http_session: aiohttp.ClientSession | None = None
         # Handler global de erro de app command (substitui o padrão da tree).
         self.tree.on_error = self.on_app_command_error
 
@@ -66,7 +84,11 @@ class LeviathanBot(commands.Bot):
     # ------------------------------------------------------------------
 
     async def setup_hook(self) -> None:
-        """Roda uma vez antes do login: banco, cogs e sync dos slash commands."""
+        """Roda uma vez antes do login: HTTP, banco, cogs e sync dos comandos."""
+        self.http_session = aiohttp.ClientSession(
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        )
         await self.db.connect()
         await init_db(self.db)
 
@@ -79,6 +101,13 @@ class LeviathanBot(commands.Bot):
         for extension in discover_cogs():
             try:
                 await self.load_extension(extension)
+            except commands.ExtensionFailed as exc:
+                # CogUnavailable é situação prevista (falta chave de API, por
+                # exemplo): merece um aviso legível, não um traceback.
+                if isinstance(exc.original, CogUnavailable):
+                    log.warning("Cog %s não carregado: %s", extension, exc.original)
+                else:
+                    log.exception("Falha ao carregar o cog %s", extension)
             except commands.ExtensionError:
                 log.exception("Falha ao carregar o cog %s", extension)
             else:
@@ -102,10 +131,13 @@ class LeviathanBot(commands.Bot):
         return synced
 
     async def close(self) -> None:
-        """Encerra a conexão com o Discord e fecha o pool do banco."""
+        """Encerra a conexão com o Discord, a sessão HTTP e o pool do banco."""
         try:
             await super().close()
         finally:
+            if self.http_session is not None:
+                await self.http_session.close()
+                self.http_session = None
             await self.db.close()
 
     async def on_ready(self) -> None:
