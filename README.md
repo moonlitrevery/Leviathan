@@ -20,6 +20,7 @@ leviathan/
     links.py      # /pirata e /sistema, lidos do JSON
     quotes.py     # cards de citação em imagem (Pillow)
     lastfm.py     # /fm: tocando, recentes, top e compatibilidade
+    quemfalou.py  # jogo de adivinhar o autor de mensagens antigas
   data/
     links.json    # conteúdo dos comandos de links (versionado, editável)
   assets/
@@ -30,6 +31,7 @@ tests/
   test_piadas.py  # deduplicação dos contadores e casamento dos gatilhos
   test_quotes.py  # segmentação de emoji e medição do card
   test_lastfm.py  # cálculo de compatibilidade musical
+  test_quemfalou.py  # filtro de mensagem, silêncio e um palpite por pessoa
 ```
 
 ## Pré-requisitos
@@ -98,6 +100,82 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `/fm recentes [membro]` | todos | Últimas 10 faixas, com horário relativo |
 | `/fm top [membro] [tipo] [periodo]` | todos | Top 10 de artistas, músicas ou álbuns |
 | `/fm compat <membro1> [membro2]` | todos | Compatibilidade musical entre duas pessoas |
+| `/quemfalou config <canal> [...]` | Gerenciar servidor | Configura canal, intervalo, pontos, fonte e duração |
+| `/quemfalou excluir <canal>` | Gerenciar servidor | Tira um canal do sorteio |
+| `/quemfalou incluir <canal>` | Gerenciar servidor | Devolve um canal ao sorteio |
+| `/quemfalou agora` | todos (cooldown 30 min) | Dispara uma rodada na hora |
+| `/quemfalou rank` | todos | Placar: pontos, acertos e taxa |
+| `/quemfalou pausar` · `retomar` | Gerenciar servidor | Liga e desliga as rodadas automáticas |
+
+## Quem falou? (`/quemfalou`)
+
+De tempos em tempos o bot posta uma mensagem antiga do servidor **sem o autor**, e as
+pessoas apostam em quem escreveu usando um seletor de membro. Quem acertar primeiro
+leva os pontos.
+
+Configure com `/quemfalou config #canal`. Sem configuração, o jogo não roda.
+
+### Privacidade
+
+**Só entram no sorteio canais que o cargo `@everyone` consegue ver E ler o histórico.**
+Isso não é conveniência: o canal do jogo é público, e sortear de um canal restrito
+exporia a mensagem para quem nunca teve acesso a ela. O bot também precisa conseguir
+ler o canal, e `/quemfalou excluir` tira canais específicos mesmo sendo públicos.
+
+O filtro está em `canais_sorteaveis()` e foi verificado contra canal privado, canal em
+que o `@everyone` vê mas não lê o histórico, canal excluído à mão, o próprio canal do
+jogo e canal que o bot não lê — todos bloqueados.
+
+### Como a mensagem é escolhida
+
+A fonte é configurável: `citacoes` (a tabela do `/quote`, que já guarda `clean_content`),
+`historico` (sorteio direto dos canais) ou `ambos`.
+
+No histórico, a técnica evita paginar anos de mensagens: escolhe um canal elegível,
+sorteia um instante entre a criação do canal e 7 dias atrás, converte com
+`discord.utils.time_snowflake` e lê 100 mensagens em volta com `history(around=...)`.
+São até 5 tentativas antes de desistir.
+
+A mensagem precisa passar por todos os filtros: não é de bot, tem pelo menos 25
+caracteres e 4 palavras **descontando os links** (o que resolve "não é só link" de
+brinde), não parece comando de bot, não é do canal do jogo, e **o autor ainda está no
+servidor** — se saiu, ninguém conseguiria acertar. Uma mensagem que já virou rodada
+nunca volta: o `UNIQUE (guild_id, origem_message_id)` garante isso.
+
+### A rodada
+
+O embed traz o texto, o canal de origem e uma data vaga ("março de 2025") — sem autor e
+sem link. Abaixo vai um `UserSelect`, e não um `Select` comum, porque o comum tem teto
+de 25 opções e o servidor tem mais gente que isso.
+
+Cada pessoa tem **um palpite**, garantido pela chave primária
+`(rodada_id, usuario_id)`. O autor da mensagem é barrado antes de gastar o palpite. As
+respostas de palpite são efêmeras; o resultado vai no embed público.
+
+Ao encerrar, a mensagem é editada revelando o autor, o link para a original, quem
+acertou e quantos palpites errados vieram, e o select fica desabilitado.
+
+**Sobrevive a restart.** O select é um `discord.ui.DynamicItem` com o id da rodada no
+`custom_id` (`quemfalou:rodada:42`), então o discord.py reconstrói o componente a partir
+da própria mensagem quando alguém interage — nada de estado em memória. Rodadas cujo
+prazo venceu durante o restart são encerradas pelo laço de expiração, que roda a cada
+30s. Confirmei que `DynamicItem` funciona com `UserSelect` no discord.py 2.7.1:
+`_refresh_state` encaminha para o item embrulhado, então `values` chega no callback.
+
+Dois acertos simultâneos são resolvidos por um `UPDATE ... WHERE status = 'ativa'`: só
+um altera linha, e o outro recebe "alguém chegou primeiro".
+
+### Agendamento
+
+O laço roda a cada 5 minutos e compara a última rodada com `intervalo_horas` da config,
+em vez de ser um `loop(hours=X)` fixo. Assim, mudar o intervalo vale na hora, sem
+reiniciar o laço. Uma rodada só nasce se: não há rodada ativa, o jogo não está pausado,
+não é horário de silêncio (padrão 2h às 9h de Brasília, e a janela pode virar a
+meia-noite) e **alguém humano falou no canal do jogo desde a última rodada** — senão um
+servidor parado viraria uma fila de rodadas sem ninguém jogando.
+
+Os dois laços são cancelados no `cog_unload`, então `/reload quemfalou` não deixa task
+órfã.
 
 ## Last.fm (`/fm`)
 

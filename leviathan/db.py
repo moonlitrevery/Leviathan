@@ -209,6 +209,83 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=9,
+        name="quemfalou",
+        statements=(
+            """
+            CREATE TABLE quemfalou_config (
+                guild_id        INTEGER PRIMARY KEY,
+                channel_id      INTEGER NOT NULL,
+                intervalo_horas REAL    NOT NULL DEFAULT 6,
+                pontos          INTEGER NOT NULL DEFAULT 10,
+                fonte           TEXT    NOT NULL DEFAULT 'ambos',
+                minutos_rodada  INTEGER NOT NULL DEFAULT 10,
+                silencio_inicio INTEGER NOT NULL DEFAULT 2,
+                silencio_fim    INTEGER NOT NULL DEFAULT 9,
+                pausado         INTEGER NOT NULL DEFAULT 0,
+                ultima_rodada   TEXT,
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            # Canais que nunca entram no sorteio, mesmo sendo públicos.
+            """
+            CREATE TABLE quemfalou_excluidos (
+                guild_id   INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """,
+            # conteudo e autor_id ficam gravados: a rodada precisa poder ser
+            # encerrada mesmo se a mensagem original for apagada no meio dela.
+            """
+            CREATE TABLE quemfalou_rodadas (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id          INTEGER NOT NULL,
+                game_channel_id   INTEGER NOT NULL,
+                game_message_id   INTEGER,
+                origem_channel_id INTEGER NOT NULL,
+                origem_message_id INTEGER NOT NULL,
+                autor_id          INTEGER NOT NULL,
+                conteudo          TEXT    NOT NULL,
+                origem_criada_em  TEXT    NOT NULL,
+                jump_url          TEXT    NOT NULL,
+                status            TEXT    NOT NULL DEFAULT 'ativa',
+                vencedor_id       INTEGER,
+                expira_em         TEXT    NOT NULL,
+                criada_em         TEXT    NOT NULL DEFAULT (datetime('now')),
+                encerrada_em      TEXT
+            )
+            """,
+            # O UNIQUE é o "não repetir a mesma mensagem": uma mensagem que já
+            # virou rodada não pode ser sorteada de novo.
+            "CREATE UNIQUE INDEX idx_quemfalou_origem"
+            " ON quemfalou_rodadas (guild_id, origem_message_id)",
+            "CREATE INDEX idx_quemfalou_status ON quemfalou_rodadas (guild_id, status)",
+            # A chave primária é a regra "um palpite por pessoa por rodada".
+            """
+            CREATE TABLE quemfalou_palpites (
+                rodada_id  INTEGER NOT NULL
+                           REFERENCES quemfalou_rodadas (id) ON DELETE CASCADE,
+                usuario_id INTEGER NOT NULL,
+                palpite_id INTEGER NOT NULL,
+                acertou    INTEGER NOT NULL,
+                criado_em  TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (rodada_id, usuario_id)
+            )
+            """,
+            """
+            CREATE TABLE quemfalou_placar (
+                guild_id   INTEGER NOT NULL,
+                usuario_id INTEGER NOT NULL,
+                pontos     INTEGER NOT NULL DEFAULT 0,
+                acertos    INTEGER NOT NULL DEFAULT 0,
+                palpites   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, usuario_id)
+            )
+            """,
+        ),
+    ),
 )
 
 
