@@ -65,15 +65,41 @@ MEDALHAS = ("🥇", "🥈", "🥉")
 # ---------------------------------------------------------------------------
 
 
+#: Teto da resposta. É o limite de uma mensagem do Discord: passar disso só
+#: descobriria o problema na hora de responder, com o gatilho já cadastrado.
+LIMITE_RESPOSTA = 2000
+
+
 @dataclass(frozen=True, slots=True)
 class Trigger:
-    """Uma palavra-gatilho e a URL que o bot responde quando ela aparece."""
+    """Uma palavra-gatilho e o que o bot responde quando ela aparece.
+
+    A resposta é texto livre: uma URL (que o Discord expande sozinho), uma frase,
+    um emoji, ou as três coisas. Menção dentro dela não pinga ninguém, porque o
+    bot inteiro roda com ``allowed_mentions=none()``.
+    """
 
     id: int
     guild_id: int
     word: str
-    url: str
+    resposta: str
     substring: bool
+
+
+#: Quanto de uma resposta cabe na confirmação e na listagem.
+PREVIA_RESPOSTA = 180
+
+
+def _resumir(resposta: str) -> str:
+    """Encurta a resposta para caber numa confirmação ou na listagem.
+
+    A quebra de linha vira símbolo: uma resposta de várias linhas desmontaria o
+    embed do ``/gatilho list``.
+    """
+    linha = resposta.replace("\n", " ⏎ ")
+    if len(linha) > PREVIA_RESPOSTA:
+        linha = linha[: PREVIA_RESPOSTA - 1] + "…"
+    return linha
 
 
 @lru_cache(maxsize=512)
@@ -105,7 +131,7 @@ def find_match(triggers: list[Trigger], content: str) -> Trigger | None:
 async def list_triggers(db: Database, guild_id: int) -> list[Trigger]:
     """Gatilhos cadastrados na guild, em ordem alfabética."""
     rows = await db.fetchall(
-        "SELECT id, guild_id, word, url, substring FROM triggers"
+        "SELECT id, guild_id, word, resposta, substring FROM triggers"
         " WHERE guild_id = ? ORDER BY word",
         (guild_id,),
     )
@@ -114,7 +140,7 @@ async def list_triggers(db: Database, guild_id: int) -> list[Trigger]:
             id=row["id"],
             guild_id=row["guild_id"],
             word=row["word"],
-            url=row["url"],
+            resposta=row["resposta"],
             substring=bool(row["substring"]),
         )
         for row in rows
@@ -132,7 +158,7 @@ async def upsert_trigger(
     db: Database,
     guild_id: int,
     word: str,
-    url: str,
+    resposta: str,
     substring: bool,
 ) -> str:
     """Cadastra ou atualiza um gatilho. Devolve ``"criado"`` ou ``"atualizado"``."""
@@ -142,14 +168,15 @@ async def upsert_trigger(
     )
     if existente is not None:
         await db.execute(
-            "UPDATE triggers SET url = ?, substring = ? WHERE id = ?",
-            (url, int(substring), existente["id"]),
+            "UPDATE triggers SET resposta = ?, substring = ? WHERE id = ?",
+            (resposta, int(substring), existente["id"]),
         )
         return "atualizado"
 
     await db.execute(
-        "INSERT INTO triggers (guild_id, word, url, substring) VALUES (?, ?, ?, ?)",
-        (guild_id, word, url, int(substring)),
+        "INSERT INTO triggers (guild_id, word, resposta, substring)"
+        " VALUES (?, ?, ?, ?)",
+        (guild_id, word, resposta, int(substring)),
     )
     return "criado"
 
@@ -171,8 +198,8 @@ async def seed_guild_triggers(db: Database, guild_id: int) -> list[str]:
     if await count_triggers(db, guild_id):
         return []
 
-    for word, url, substring in SEED_TRIGGERS:
-        await upsert_trigger(db, guild_id, word, url, substring)
+    for word, resposta, substring in SEED_TRIGGERS:
+        await upsert_trigger(db, guild_id, word, resposta, substring)
     return [word for word, _, _ in SEED_TRIGGERS]
 
 
@@ -444,7 +471,7 @@ class Piadas(commands.Cog):
         self._cooldowns[chave] = agora
 
         try:
-            await message.reply(acertou.url, mention_author=False)
+            await message.reply(acertou.resposta, mention_author=False)
         except discord.HTTPException:
             log.exception("Falha ao responder o gatilho %r", acertou.word)
 
@@ -453,7 +480,7 @@ class Piadas(commands.Cog):
     @gatilho.command(name="add", description="Cadastra ou atualiza uma palavra-gatilho.")
     @app_commands.describe(
         palavra="Palavra que dispara a resposta",
-        url="URL que o bot responde",
+        resposta="O que o bot responde: texto, link, emoji — o que quiser",
         substring="Casar também no meio de outras palavras (padrão: não)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -461,30 +488,41 @@ class Piadas(commands.Cog):
         self,
         interaction: discord.Interaction,
         palavra: str,
-        url: str,
+        resposta: str,
         substring: bool = False,
     ) -> None:
         word = palavra.strip().lower()
-        url = url.strip()
+        resposta = resposta.strip()
 
         if not word:
             await interaction.response.send_message(
                 "A palavra não pode ser vazia.", ephemeral=True
             )
             return
-        if not url.startswith(("http://", "https://")):
+        # A resposta é texto livre de propósito: link, frase ou emoji. A única
+        # regra é caber numa mensagem do Discord.
+        if not resposta:
             await interaction.response.send_message(
-                "A URL precisa começar com `http://` ou `https://`.", ephemeral=True
+                "A resposta não pode ser vazia.", ephemeral=True
+            )
+            return
+        if len(resposta) > LIMITE_RESPOSTA:
+            await interaction.response.send_message(
+                f"A resposta tem {len(resposta)} caracteres e o limite de uma "
+                f"mensagem do Discord é {LIMITE_RESPOSTA}.",
+                ephemeral=True,
             )
             return
 
         assert interaction.guild_id is not None
-        acao = await upsert_trigger(self.db, interaction.guild_id, word, url, substring)
+        acao = await upsert_trigger(
+            self.db, interaction.guild_id, word, resposta, substring
+        )
         self._invalidate_triggers(interaction.guild_id)
 
         modo = "substring" if substring else "palavra inteira"
         await interaction.response.send_message(
-            f"Gatilho `{word}` {acao} ({modo}) → {url}", ephemeral=True
+            f"Gatilho `{word}` {acao} ({modo}) → {_resumir(resposta)}", ephemeral=True
         )
 
     @gatilho.command(name="remove", description="Remove uma palavra-gatilho.")
@@ -520,7 +558,7 @@ class Piadas(commands.Cog):
         linhas = []
         for trigger in triggers:
             sufixo = " _(substring)_" if trigger.substring else ""
-            linhas.append(f"**{trigger.word}**{sufixo}\n{trigger.url}")
+            linhas.append(f"**{trigger.word}**{sufixo}\n{_resumir(trigger.resposta)}")
 
         embed = discord.Embed(
             title=f"Gatilhos ({len(triggers)})",

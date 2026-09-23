@@ -113,7 +113,7 @@ não aparecem no outro.
 | --- | --- | --- |
 | `/ping` | todos | Mostra a latência do gateway e o ida-e-volta da API |
 | `/reload <cog>` | dono do bot | Recarrega um cog e re-sincroniza os comandos, sem reiniciar |
-| `/gatilho add <palavra> <url> [substring]` | Gerenciar servidor | Cadastra ou atualiza uma palavra-gatilho |
+| `/gatilho add <palavra> <resposta> [substring]` | Gerenciar servidor | Cadastra ou atualiza uma palavra-gatilho. A resposta é texto livre: link, frase ou emoji |
 | `/gatilho remove <palavra>` | Gerenciar servidor | Remove uma palavra-gatilho |
 | `/gatilho list` | todos | Lista os gatilhos em vigor no servidor |
 | `/contador criar <emoji> <nome> <canal_placar>` | Gerenciar servidor | Cria um contador alimentado por reações |
@@ -509,7 +509,15 @@ quebrado, o discord.py faz rollback e a versão anterior continua no ar.
 ## Gatilhos de texto
 
 Quando alguém escreve uma palavra cadastrada, o bot responde àquela mensagem (reply,
-sem ping) com a URL configurada. Mensagens de bots são ignoradas.
+sem ping) com o que estiver configurado. Mensagens de bots são ignoradas.
+
+A resposta é **texto livre**: um link (que o Discord expande sozinho), uma frase, um
+emoji, ou tudo junto. O único limite é o de uma mensagem do Discord, 2000 caracteres.
+Quebra de linha é preservada, então uma resposta pode ter várias linhas.
+
+Menção dentro da resposta **não pinga ninguém**: o bot roda com
+`allowed_mentions=none()` globalmente, e o reply do gatilho não abre exceção — ao
+contrário do cargo dos alertas, que precisa liberar o ping explicitamente.
 
 - O casamento é **case-insensitive** e por **palavra inteira** por padrão: `papoi` casa
   em `PAPOI!` e `(papoi)`, mas não em `papoizinho`. A flag `substring` do `/gatilho add`

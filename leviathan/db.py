@@ -328,6 +328,17 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=11,
+        name="trigger_resposta",
+        statements=(
+            # A coluna guardava só URL porque era só isso que o gatilho aceitava.
+            # Agora ela guarda qualquer texto que o bot responde, e o nome "url"
+            # passaria a mentir sobre o conteúdo. O RENAME COLUMN preserva os
+            # dados; os gatilhos já cadastrados continuam valendo.
+            "ALTER TABLE triggers RENAME COLUMN url TO resposta",
+        ),
+    ),
 )
 
 

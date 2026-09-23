@@ -342,7 +342,7 @@ async def test_seed_cria_papoi_em_guild_vazia(db):
 
     triggers = await list_triggers(db, GUILD)
     assert [t.word for t in triggers] == ["papoi"]
-    assert triggers[0].url.startswith("https://")
+    assert triggers[0].resposta.startswith("https://")
     assert triggers[0].guild_id == GUILD, "o seed é da guild, não global"
 
 
@@ -413,7 +413,7 @@ async def test_upsert_cria_e_depois_atualiza(db):
     assert await upsert_trigger(db, GUILD, "minhoca", "https://b.com", True) == "atualizado"
 
     minhoca = next(t for t in await list_triggers(db, GUILD) if t.word == "minhoca")
-    assert minhoca.url == "https://b.com"
+    assert minhoca.resposta == "https://b.com"
     assert minhoca.substring is True
 
 
@@ -645,6 +645,90 @@ def _trigger(word: str, *, substring: bool, id_: int = 1):
         id=id_,
         guild_id=GUILD,
         word=word,
-        url="https://exemplo.com",
+        resposta="https://exemplo.com",
         substring=substring,
     )
+
+
+# ---------------------------------------------------------------------------
+# A resposta é texto livre, não só URL
+# ---------------------------------------------------------------------------
+
+
+async def test_resposta_pode_ser_texto_puro(db):
+    """O pedido original: gatilho que responde uma frase, sem link nenhum."""
+    assert await upsert_trigger(db, GUILD, "bom dia", "bom dia pra você também", False) == "criado"
+
+    trigger = next(t for t in await list_triggers(db, GUILD) if t.word == "bom dia")
+    assert trigger.resposta == "bom dia pra você também"
+
+
+async def test_resposta_pode_ser_emoji_ou_qualquer_coisa(db):
+    await upsert_trigger(db, GUILD, "eita", "🗿", False)
+    await upsert_trigger(db, GUILD, "misto", "olha isso https://exemplo.com 👀", False)
+
+    respostas = {t.word: t.resposta for t in await list_triggers(db, GUILD)}
+    assert respostas["eita"] == "🗿"
+    assert respostas["misto"] == "olha isso https://exemplo.com 👀"
+
+
+async def test_resposta_de_varias_linhas_e_guardada_inteira(db):
+    texto = "primeira linha\nsegunda linha"
+    await upsert_trigger(db, GUILD, "poema", texto, False)
+
+    trigger = next(t for t in await list_triggers(db, GUILD) if t.word == "poema")
+    assert trigger.resposta == texto
+
+
+async def test_gatilho_de_texto_responde_o_texto(db, monkeypatch):
+    """Do cadastro até o reply: o que foi cadastrado é o que sai no canal."""
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    await upsert_trigger(db, GUILD, "saudade", "também sinto", False)
+
+    cog = Piadas(_BotFake(db))
+    mensagem = _MensagemFake("que saudade disso")
+    await cog.on_message(mensagem)
+
+    assert mensagem.respostas == ["também sinto"], "sem URL nenhuma envolvida"
+
+
+async def test_gatilho_de_varias_linhas_responde_inteiro(db, monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    receita = "1. farinha\n2. ovo"
+    await upsert_trigger(db, GUILD, "receita", receita, False)
+
+    cog = Piadas(_BotFake(db))
+    mensagem = _MensagemFake("manda a receita")
+    await cog.on_message(mensagem)
+
+    assert mensagem.respostas == [receita], "a resposta sai inteira, com a quebra"
+
+
+def test_resumir_encurta_resposta_longa():
+    from leviathan.cogs.piadas import PREVIA_RESPOSTA, _resumir
+
+    longa = "a" * 500
+
+    resumida = _resumir(longa)
+
+    assert len(resumida) == PREVIA_RESPOSTA
+    assert resumida.endswith("…")
+
+
+def test_resumir_nao_mexe_em_resposta_curta():
+    from leviathan.cogs.piadas import _resumir
+
+    assert _resumir("oi") == "oi"
+
+
+def test_resumir_achata_quebra_de_linha():
+    """Resposta de várias linhas desmontaria o embed do /gatilho list."""
+    from leviathan.cogs.piadas import _resumir
+
+    assert "\n" not in _resumir("uma\noutra")
+
+
+def test_limite_da_resposta_e_o_da_mensagem_do_discord():
+    from leviathan.cogs.piadas import LIMITE_RESPOSTA
+
+    assert LIMITE_RESPOSTA == 2000
