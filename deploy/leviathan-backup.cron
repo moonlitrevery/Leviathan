@@ -1,0 +1,25 @@
+# Backup diário do banco do Leviathan Bot.
+#
+# Instalação (escolha a linha que corresponde ao seu deploy e apague a outra):
+#     sudo cp deploy/leviathan-backup.cron /etc/cron.d/leviathan-backup
+#     sudo chown root:root /etc/cron.d/leviathan-backup
+#     sudo chmod 644 /etc/cron.d/leviathan-backup
+#
+# Arquivo em /etc/cron.d precisa do campo de usuário (a sexta coluna) e NÃO pode
+# ter ponto no nome, senão o cron o ignora em silêncio.
+#
+# 04:12 e não 04:00 de propósito: horário quebrado não disputa a VM com todo o
+# resto que o mundo agenda na hora cheia. O fuso é o da máquina — a VM do Oracle
+# vem configurada em UTC.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# --- systemd (bot rodando direto na VM) ---
+# m  h dom mon dow  usuário     comando
+12   4  *   *   *   leviathan   mkdir -p /opt/leviathan/backups && /opt/leviathan/deploy/backup.sh >> /opt/leviathan/backups/backup.log 2>&1
+
+# --- Docker (o banco vive no volume nomeado) ---
+# O script e o sqlite3 estão dentro da imagem, e os backups ficam no mesmo
+# volume do banco, então sobrevivem a "docker compose down".
+# 12 4 * * *   root   docker exec -e DESTINO=/app/data/backups leviathan /app/deploy/backup.sh >> /var/log/leviathan-backup.log 2>&1

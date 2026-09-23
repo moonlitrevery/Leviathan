@@ -27,3 +27,6 @@ Thumbs.db
 
 # Previews de imagem gerados localmente
 preview/
+
+# Backups do banco gerados por deploy/backup.sh
+/backups/

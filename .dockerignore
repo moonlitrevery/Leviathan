@@ -1,0 +1,45 @@
+# Fora da imagem: segredo, dados, ambiente local e o que só existe para
+# desenvolvimento. O que o bot precisa em runtime é leviathan/ (com os assets),
+# o pyproject.toml e o uv.lock.
+
+# Segredo. O .env chega montado pelo compose, nunca dentro da imagem — uma
+# imagem com token embutido vaza junto se ela for publicada.
+.env
+.env.*
+!.env.example
+
+# Banco, cache de emoji e backups: vivem no volume nomeado.
+data/
+*.db
+*.db-wal
+*.db-shm
+backups/
+
+# Ambiente local: a imagem monta o seu próprio .venv, e o de cá é de outra
+# arquitetura (x86 Windows) — copiá-lo quebraria a imagem ARM.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Saída do preview dos cards de citação.
+preview/
+
+# Só interessam ao desenvolvimento.
+.git/
+.gitignore
+.gitattributes
+tests/
+scripts/
+.vscode/
+.idea/
+Dockerfile
+docker-compose.yml
+.dockerignore
+# De deploy/ só o backup.sh entra (ele roda dentro do contêiner); a unit do
+# systemd e o cron são do host. Listados um a um em vez de excluir a pasta e
+# abrir exceção, porque a ordem de precedência entre "deploy/" e "!deploy/..."
+# é sutil demais para depender dela.
+deploy/*.service
+deploy/*.cron

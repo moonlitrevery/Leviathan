@@ -1,0 +1,67 @@
+# Alternativa sem Docker: roda o bot direto na VM, com o uv.
+#
+# Instalação (Ubuntu na VM ARM do Oracle), com o projeto em /opt/leviathan e o
+# uv em /usr/local/bin/uv:
+#     sudo cp deploy/leviathan.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now leviathan
+#
+# O README tem o passo a passo completo, inclusive a criação do usuário.
+
+[Unit]
+Description=Leviathan Bot (Discord)
+Documentation=https://github.com/moonlitrevery/Leviathan
+# O bot não serve nada: só precisa de rede para sair.
+After=network-online.target
+Wants=network-online.target
+# Se o bot entrar em ciclo de queda, o systemd desiste de martelar: 5 partidas
+# em 5 minutos e ele para, deixando o motivo no journal. (Estas duas chaves são
+# da seção [Unit], não da [Service].)
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=leviathan
+Group=leviathan
+WorkingDirectory=/opt/leviathan
+
+# O uv precisa de lugar para escrever o cache e o Python que ele gerencia.
+# Como o /home está somente leitura aqui embaixo, os dois vão para dentro do
+# diretório do projeto, que é o único caminho gravável.
+Environment=UV_CACHE_DIR=/opt/leviathan/.cache/uv
+Environment=UV_PYTHON_INSTALL_DIR=/opt/leviathan/.local/python
+Environment=PYTHONUNBUFFERED=1
+
+# Instala a partir do uv.lock antes de subir: um git pull que mudou dependência
+# já entra no restart, sem passo manual. --locked falha se o lock estiver
+# desatualizado, em vez de resolver versões diferentes das testadas.
+ExecStartPre=/usr/local/bin/uv sync --locked --no-dev
+ExecStart=/usr/local/bin/uv run --no-dev --no-sync python -m leviathan
+
+# Reinicia sempre, inclusive depois de uma saída com código 0.
+Restart=always
+RestartSec=10s
+
+# SIGTERM é o que o bot trata para fechar a sessão HTTP e o banco.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# O log vai todo para o journal (journalctl -u leviathan).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=leviathan
+
+# O bot lê o .env e escreve o banco e o cache de emoji dentro do próprio
+# diretório; o resto do sistema fica somente leitura.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/leviathan
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

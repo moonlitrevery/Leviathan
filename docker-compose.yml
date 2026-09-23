@@ -1,0 +1,29 @@
+services:
+  leviathan:
+    build: .
+    image: leviathan:local
+    container_name: leviathan
+    # Sobe sozinho no boot da VM e depois de qualquer queda. "unless-stopped"
+    # e não "always" para que um "docker compose stop" proposital continue valendo
+    # depois de reiniciar a máquina.
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Banco e cache de emoji. Volume nomeado, não bind: sobrevive a
+      # "docker compose down" e a recriações da imagem.
+      - leviathan-data:/app/data
+      # O .env também entra montado e somente leitura, porque o config.py lê o
+      # arquivo diretamente além das variáveis de ambiente.
+      - ./.env:/app/.env:ro
+    # O journald da VM já rotaciona o que sai daqui, mas o driver json-file do
+    # Docker não rotaciona sozinho: sem isso, o log cresce até encher o disco.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Nenhuma porta publicada: só conexão de saída.
+
+volumes:
+  leviathan-data:

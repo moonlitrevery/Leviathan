@@ -22,10 +22,17 @@ leviathan/
     lastfm.py     # /fm: tocando, recentes, top e compatibilidade
     quemfalou.py  # jogo de adivinhar o autor de mensagens antigas
     alertas.py    # avisos de vídeo, capítulo, episódio e RSS novos
+    saude.py      # log de vida de hora em hora
   data/
     links.json    # conteúdo dos comandos de links (versionado, editável)
   assets/
     fonts/        # fonte embarcada, usada pelos cards de citação
+deploy/
+  leviathan.service       # unit do systemd (alternativa ao Docker)
+  leviathan-backup.cron   # agendamento diário do backup
+  backup.sh               # backup do banco com o .backup do sqlite3
+Dockerfile
+docker-compose.yml
 scripts/
   preview_quote.py  # gera previews do card sem subir o bot
 tests/
@@ -35,6 +42,7 @@ tests/
   test_lastfm.py  # cálculo de compatibilidade musical
   test_quemfalou.py  # filtro de mensagem, silêncio e um palpite por pessoa
   test_alertas.py    # parse de feed, agrupamento de capítulos, backoff e poda
+  test_saude.py      # formatação do log de vida e descoberta dos laços
 ```
 
 ## Pré-requisitos
@@ -550,6 +558,210 @@ No servidor, com o bot no ar:
 5. Reaja com 🪱 em outra mensagem → vai para `3`.
 6. Apague a mensagem de placar e provoque um incremento → o bot recria o placar.
 7. `/contador remover teste` limpa tudo.
+
+## Deploy na VM ARM do Oracle Cloud
+
+O alvo é uma instância **Ampere A1 (aarch64)** do Always Free rodando Ubuntu. Vale
+para qualquer ARM64 com Linux.
+
+### Dependências em aarch64
+
+Nenhuma dependência precisa compilar nessa arquitetura. Todas as wheels foram
+conferidas no PyPI, nas versões que estão no `uv.lock`:
+
+| Pacote | Situação em linux/aarch64 |
+| --- | --- |
+| aiohttp | wheel `manylinux_2_17_aarch64` |
+| pillow | wheel `manylinux_2_28_aarch64` |
+| discord.py, aiosqlite, feedparser, emoji, python-dotenv | wheel pura (`py3-none-any`) |
+| multidict, yarl, frozenlist, propcache | wheel pura |
+
+Ou seja: **nada de `build-essential`, `python3-dev`, `libjpeg-dev` ou `zlib1g-dev`**.
+Se um dia alguma wheel sumir e o Pillow precisar ser compilado, aí sim seriam
+necessários `build-essential python3-dev libjpeg-dev zlib1g-dev libfreetype6-dev`.
+
+Duas armadilhas que a imagem já evita:
+
+- **Alpine não serve.** As wheels de aarch64 do Pillow e do aiohttp são
+  manylinux, ou seja, glibc. No musl do Alpine a instalação cairia no sdist e
+  teria de compilar. A imagem é `python:3.12-slim-bookworm`, que tem
+  `linux/arm64/v8` oficial.
+- **Python 3.12, não 3.13+.** De 3.13 em diante o discord.py passa a depender do
+  `audioop-lts`, que não está no `uv.lock`.
+
+### Com Docker (recomendado)
+
+```bash
+sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
+sudo usermod -aG docker "$USER" && newgrp docker
+
+git clone https://github.com/moonlitrevery/Leviathan.git /opt/leviathan
+cd /opt/leviathan
+cp .env.example .env && nano .env      # DISCORD_TOKEN, GUILD_ID, LASTFM_API_KEY
+
+docker compose up -d --build           # o build roda na própria VM, em arm64
+docker compose logs -f
+```
+
+O `docker-compose.yml` já traz `restart: unless-stopped` (sobe no boot e depois
+de qualquer queda), o volume nomeado `leviathan-data` em `/app/data` (banco **e**
+cache de emoji), o `.env` montado somente leitura e rotação do log em 5 arquivos
+de 10 MB — o driver `json-file` do Docker não rotaciona sozinho e encheria o
+disco da VM.
+
+Build multi-arch a partir de uma máquina x86, se preferir não compilar na VM:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t SEU_USUARIO/leviathan --push .
+```
+
+### Sem Docker, com systemd
+
+```bash
+sudo apt update && sudo apt install -y git curl sqlite3
+sudo useradd --system --create-home --home-dir /home/leviathan --shell /usr/sbin/nologin leviathan
+
+sudo git clone https://github.com/moonlitrevery/Leviathan.git /opt/leviathan
+sudo chown -R leviathan:leviathan /opt/leviathan
+
+# uv em /usr/local/bin, que é onde a unit espera encontrá-lo
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
+
+sudo -u leviathan cp /opt/leviathan/.env.example /opt/leviathan/.env
+sudo -u leviathan nano /opt/leviathan/.env
+
+sudo cp /opt/leviathan/deploy/leviathan.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now leviathan
+```
+
+A unit usa `Restart=always` com `RestartSec=10`, faz `uv sync --locked` antes de
+cada partida (um `git pull` que mudou dependência já entra no restart) e desiste
+depois de 5 quedas em 5 minutos, para não martelar a VM em ciclo de erro. O
+`uv` guarda cache e Python dentro de `/opt/leviathan`, porque a unit deixa
+`/home` somente leitura.
+
+### Firewall do Oracle
+
+**Não precisa abrir porta nenhuma.** O bot só faz conexão de **saída**: gateway do
+Discord (WebSocket), API do Discord, YouTube, MangaDex, AniList e Last.fm — tudo
+HTTPS/443 iniciado por ele. Não há servidor HTTP, webhook nem healthcheck
+escutando, e por isso não há `EXPOSE` no Dockerfile nem portas publicadas no
+compose.
+
+Em outras palavras: a Security List / NSG da VCN e o `iptables` da imagem Ubuntu
+do Oracle podem continuar como vieram. A única regra de entrada de que você
+precisa é a do SSH (22), que já existe. Se o bot não conectar, o problema **não**
+é porta de entrada fechada — olhe o token, a saída para a internet e o DNS.
+
+### Como atualizar
+
+```bash
+cd /opt/leviathan
+git pull
+
+# Docker:
+docker compose up -d --build
+
+# systemd (o uv sync roda sozinho no ExecStartPre):
+sudo systemctl restart leviathan
+```
+
+Migração de banco não precisa de passo manual: o `init_db()` aplica no boot o que
+estiver faltando, uma migration por vez. Vale tirar um backup antes de atualizar,
+justamente por causa disso.
+
+### Como ver os logs
+
+```bash
+# Docker
+docker compose logs -f              # acompanhar
+docker compose logs --since 1h      # última hora
+docker compose logs | grep "vida |" # só o batimento
+
+# systemd
+journalctl -u leviathan -f
+journalctl -u leviathan --since "1 hour ago"
+journalctl -u leviathan -p warning  # só avisos e erros
+```
+
+### Log de vida
+
+De hora em hora o cog `saude.py` escreve uma linha dizendo que está tudo de pé:
+
+```
+vida | conectado como Leviathan#1234 | 1 guild(s) | latência: 48 ms | no ar há 3h12m | assinaturas: 7 (2 em backoff) | laços: 3/3 rodando
+```
+
+Serve para distinguir "o servidor está quieto" de "o bot morreu" — os dois são
+silêncio no Discord, mas só um deles some do log. Os laços são descobertos
+sozinhos em todos os cogs carregados, então um cog novo com `tasks.loop` entra no
+relatório sem ninguém precisar editar o `saude.py`. Quando algo está errado, sai
+também uma linha de WARNING por problema:
+
+```
+vida | alertas.ciclo: PAROU COM ERRO
+```
+
+### Backup
+
+`deploy/backup.sh` usa o **`.backup` do sqlite3**, não `cp`. A diferença importa:
+o banco roda em modo WAL, então o arquivo `.db` quente está incompleto — parte das
+escritas confirmadas vive no `-wal`. Copiar só o `.db` rende um backup
+silenciosamente desatualizado, e copiar os três arquivos em sequência rende uma
+combinação que nunca existiu. O `.backup` usa a API de backup online do SQLite e
+lê um retrato consistente com o bot escrevendo.
+
+Cada execução verifica o resultado com `PRAGMA integrity_check` antes de aceitá-lo,
+só então renomeia o arquivo para o nome definitivo (uma execução interrompida não
+deixa um `.db` pela metade parecendo bom), comprime com gzip e apaga o que passou
+de 7 dias.
+
+```bash
+sudo -u leviathan /opt/leviathan/deploy/backup.sh
+DESTINO=/mnt/backups RETENCAO=14 deploy/backup.sh   # dá para mudar
+
+sudo cp deploy/leviathan-backup.cron /etc/cron.d/leviathan-backup
+sudo chown root:root /etc/cron.d/leviathan-backup && sudo chmod 644 /etc/cron.d/leviathan-backup
+```
+
+Com Docker, o script e o `sqlite3` estão dentro da imagem, e os backups ficam no
+mesmo volume do banco:
+
+```bash
+docker exec -e DESTINO=/app/data/backups leviathan /app/deploy/backup.sh
+```
+
+Restaurar é descomprimir por cima, com o bot parado:
+
+```bash
+sudo systemctl stop leviathan          # ou: docker compose stop
+gunzip -c backups/leviathan-AAAAMMDD-HHMMSS.db.gz > data/leviathan.db
+rm -f data/leviathan.db-wal data/leviathan.db-shm   # sobras do banco antigo
+sudo systemctl start leviathan         # ou: docker compose start
+```
+
+### Portabilidade do código
+
+O código não assume Windows. Todos os caminhos são `pathlib.Path` montados a
+partir de `Path(__file__)`, nunca strings com `\`; o `links.json` é lido com
+`encoding="utf-8"` explícito; a fonte dos cards é um arquivo versionado em
+`leviathan/assets/fonts/Inter.ttf`, carregado por caminho absoluto, sem depender
+de fonte instalada no sistema.
+
+Dois pontos que **são** específicos de plataforma e estão resolvidos:
+
+- O `setup_logging()` faz `reconfigure(encoding="utf-8")` na saída. Isso existe
+  por causa do Windows, onde a saída redirecionada cai no code page local e
+  embaralha os acentos; no Linux é inofensivo.
+- O repositório é desenvolvido no Windows com `core.autocrlf=true`. O
+  `.gitattributes` força LF em `*.sh`, `*.service`, `*.cron`, `Dockerfile` e
+  `docker-compose.yml`, senão eles chegariam na VM com CRLF e quebrariam — o
+  shell reclama de `\r` no shebang e o systemd não entende a unit. O bit de
+  execução do `backup.sh` também está registrado no índice do git (`100755`).
+
+O fuso horário é tratado no código com offset fixo de UTC−3 (`FUSO`), sem
+depender do `tzdata` da máquina, então a VM pode continuar em UTC.
 
 ## Adicionando uma feature
 
