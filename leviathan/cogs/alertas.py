@@ -171,6 +171,24 @@ class Item:
     detalhe: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class Entrega:
+    """O que realmente saiu num envio e, se algo deu errado, o motivo.
+
+    Um booleano não bastaria: quando os itens viram vários embeds e o terceiro
+    falha, os dois primeiros já chegaram no canal. Quem marca os vistos precisa
+    saber exatamente o que foi entregue, senão um item que ninguém viu ficaria
+    marcado e nunca mais viraria alerta.
+    """
+
+    entregues: tuple[Item, ...] = ()
+    erro: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.erro is None
+
+
 def calcular_backoff(falhas: int, base: timedelta) -> timedelta:
     """Espera até a próxima tentativa, dobrando a cada falha consecutiva.
 
@@ -926,25 +944,53 @@ class Alertas(commands.Cog):
                 assinatura.id, len(marcar),
             )
 
+        # Itens que não passam por entrega nenhuma: os que a carga pendente
+        # silencia e os shorts descartados. Podem ser marcados direto, porque não
+        # existe aviso para dar errado.
+        sem_entrega = {item_id for item_id in marcar} - {item.id for item in novos}
+
         if assinatura.tipo == TIPO_YOUTUBE and assinatura.opcoes.get("ignorar_shorts"):
-            # Os shorts são descartados do aviso, mas entram em "marcar": se não
-            # entrassem, seriam testados de novo a cada checagem, para sempre.
+            # O short descartado é marcado assim mesmo: se não fosse, seria
+            # testado de novo a cada checagem, para sempre.
             filtrados = []
             for item in novos:
-                if not await self.e_short(item.id):
+                if await self.e_short(item.id):
+                    sem_entrega.add(item.id)
+                else:
                     filtrados.append(item)
             novos = filtrados
 
+        entrega = Entrega()
         if novos:
-            await self.notificar(assinatura, novos)
-        await marcar_vistos(self.db, assinatura.id, marcar)
+            entrega = await self.notificar(assinatura, novos)
+            if not entrega.ok:
+                log.warning(
+                    "Falha ao entregar %d de %d alerta(s) da assinatura %d (%s): %s",
+                    len(novos) - len(entrega.entregues), len(novos),
+                    assinatura.id, assinatura.nome, entrega.erro,
+                )
+
+        # O item que não chegou ao canal continua não-visto: é o que garante que
+        # a próxima checagem tente entregá-lo de novo, em vez de sumir calado.
+        entregues = {item.id for item in entrega.entregues}
+        a_marcar = [
+            item_id
+            for item_id in marcar
+            if item_id in sem_entrega or item_id in entregues
+        ]
+        await marcar_vistos(self.db, assinatura.id, a_marcar)
+
+        # A entrega falha entra no backoff da assinatura como qualquer outra
+        # falha: não adianta insistir de cinco em cinco minutos num canal sem
+        # permissão.
+        falhas = assinatura.falhas + 1 if not entrega.ok else 0
         await registrar_checagem(
             self.db,
             assinatura.id,
-            falhou=False,
-            proxima=self.proxima_checagem(assinatura, falhas=0),
+            falhou=not entrega.ok,
+            proxima=self.proxima_checagem(assinatura, falhas=falhas),
         )
-        return novos
+        return list(entrega.entregues)
 
     async def primeira_carga(self, assinatura: Assinatura) -> int:
         """Marca tudo que já existe como visto, sem notificar nada.
@@ -1019,14 +1065,49 @@ class Alertas(commands.Cog):
             embed.set_thumbnail(url=capa)
         return embed
 
-    async def notificar(self, assinatura: Assinatura, itens: list[Item]) -> None:
+    def bot_conectado(self) -> bool:
+        """Se dá para confiar no cache do bot para resolver um canal.
+
+        Enquanto o bot não terminou de conectar, ``get_channel`` devolve ``None``
+        para canais que existem. Sem essa distinção, um alerta seria descartado
+        como "canal apagado" só porque chegou cedo demais.
+        """
+        return self.bot.is_ready() and not self.bot.is_closed()
+
+    def montar_envios(
+        self, assinatura: Assinatura, itens: list[Item]
+    ) -> list[tuple[discord.Embed, list[Item]]]:
+        """Cada embed a enviar, junto dos itens que ele cobre.
+
+        O par existe por causa da entrega parcial: se um envio falhar no meio, é
+        essa correspondência que diz quais itens já chegaram ao canal.
+        """
+        if len(itens) > MAX_EMBEDS_SEPARADOS:
+            return [(self.embed_do_lote(assinatura, itens), list(itens))]
+        return [(self.embed_do_item(assinatura, item), [item]) for item in itens]
+
+    async def notificar(self, assinatura: Assinatura, itens: list[Item]) -> Entrega:
+        """Envia os alertas e conta o que de fato saiu.
+
+        Nunca engole a falha: quem chama precisa saber o que não foi entregue
+        para não marcar como visto um item que ninguém chegou a ver.
+        """
         canal = self.bot.get_channel(assinatura.channel_id)
         if not isinstance(canal, discord.abc.Messageable):
+            if not self.bot_conectado():
+                # Cache ainda frio: é situação passageira, tenta de novo depois.
+                return Entrega(
+                    erro="o bot ainda não está conectado para resolver o canal"
+                )
+            # Canal apagado de verdade. Os itens vão como vistos de propósito:
+            # sem isso a assinatura tentaria entregá-los para sempre, a cada
+            # checagem, num canal que não existe mais.
             log.warning(
-                "Canal %d da assinatura %d sumiu; nada foi enviado",
-                assinatura.channel_id, assinatura.id,
+                "Canal %d da assinatura %d (%s) não existe mais; %d item(ns)"
+                " marcados como vistos sem aviso",
+                assinatura.channel_id, assinatura.id, assinatura.nome, len(itens),
             )
-            return
+            return Entrega(entregues=tuple(itens))
 
         conteudo = None
         # O bot usa allowed_mentions=none() globalmente, então o ping só sai se
@@ -1044,25 +1125,28 @@ class Alertas(commands.Cog):
                 roles=[discord.Object(id=assinatura.cargo_id)],
             )
 
-        if len(itens) > MAX_EMBEDS_SEPARADOS:
-            embeds = [self.embed_do_lote(assinatura, itens)]
-        else:
-            embeds = [self.embed_do_item(assinatura, item) for item in itens]
-
-        try:
-            for posicao, embed in enumerate(embeds):
+        entregues: list[Item] = []
+        for posicao, (embed, cobertos) in enumerate(
+            self.montar_envios(assinatura, itens)
+        ):
+            try:
                 await canal.send(
                     content=conteudo if posicao == 0 else None,
                     embed=embed,
                     allowed_mentions=permitidas if posicao == 0 else discord.AllowedMentions.none(),
                 )
-        except discord.Forbidden:
-            log.warning(
-                "Sem permissão para avisar no canal %d (assinatura %d)",
-                assinatura.channel_id, assinatura.id,
-            )
-        except discord.HTTPException:
-            log.exception("Falha ao enviar o alerta da assinatura %d", assinatura.id)
+            except discord.Forbidden:
+                return Entrega(
+                    entregues=tuple(entregues),
+                    erro=f"sem permissão para postar no canal {assinatura.channel_id}",
+                )
+            except discord.HTTPException as exc:
+                return Entrega(
+                    entregues=tuple(entregues),
+                    erro=f"o Discord recusou o envio: {exc}",
+                )
+            entregues.extend(cobertos)
+        return Entrega(entregues=tuple(entregues))
 
     # -- comandos -----------------------------------------------------------
 
@@ -1395,6 +1479,9 @@ class Alertas(commands.Cog):
         name="testar", description="Checa uma assinatura agora, sem marcar nada."
     )
     @app_commands.describe(assinatura="Qual assinatura testar")
+    # Cada uso é uma requisição a uma API externa, então vale a mesma exigência
+    # dos comandos que escrevem.
+    @app_commands.checks.has_permissions(manage_guild=True)
     async def cmd_testar(self, interaction: discord.Interaction, assinatura: str) -> None:
         assert interaction.guild_id is not None
         alvo = await self._assinatura_escolhida(interaction.guild_id, assinatura)

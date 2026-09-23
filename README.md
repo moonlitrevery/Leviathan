@@ -115,7 +115,7 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `/alerta rss <url> <nome> [...]` | Gerenciar servidor | Avisa quando sair item novo em qualquer feed |
 | `/alerta list` | todos | Assinaturas do servidor, com canal e última checagem |
 | `/alerta remover <assinatura>` | Gerenciar servidor | Cancela uma assinatura |
-| `/alerta testar <assinatura>` | todos | Checa na hora e mostra o item mais recente, sem marcar nada |
+| `/alerta testar <assinatura>` | Gerenciar servidor | Checa na hora e mostra o item mais recente, sem marcar nada |
 
 ## Alertas de conteúdo novo (`/alerta`)
 
@@ -192,6 +192,22 @@ O cargo a mencionar é opcional e por assinatura. Como o bot roda com
 `allowed_mentions=none()` globalmente, o ping só funciona porque o envio passa um
 `AllowedMentions(roles=[cargo])` explícito — com `everyone` e `users` desligados,
 para liberar exatamente aquele cargo e nada mais.
+
+**Nada é marcado como visto sem ter sido entregue.** `notificar()` devolve uma
+`Entrega` com os itens que realmente saíram, e só esses entram na lista de
+vistos. Se a permissão mudou, o canal foi apagado ou o Discord devolveu 500, o
+item continua não-visto, a assinatura conta uma falha (entra no backoff) e a
+próxima checagem tenta entregar de novo — em vez de o vídeo sumir calado.
+
+A entrega parcial é tratada item a item: quando os avisos viram vários embeds e o
+terceiro falha, os dois primeiros já estão no canal, então só eles são marcados e
+o terceiro sai na checagem seguinte.
+
+Canal apagado é o único caso em que o item é marcado sem aviso: aí `get_channel`
+devolve `None` com o bot conectado, o log sobe para WARNING e os itens entram
+como vistos, senão a assinatura tentaria entregá-los para sempre num canal que
+não existe mais. Com o bot ainda desconectado, o `None` é só cache frio e a
+entrega é adiada.
 
 ### Agendamento e resiliência
 

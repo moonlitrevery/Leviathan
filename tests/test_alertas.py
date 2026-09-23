@@ -14,15 +14,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import discord
 import pytest
 
 from leviathan.cogs.alertas import (
     BACKOFF_MAX,
     LIMITE_ITENS,
     LIMITE_VISTOS,
+    MAX_EMBEDS_SEPARADOS,
     TIPO_RSS,
     TIPO_YOUTUBE,
     Alertas,
+    Entrega,
     FonteIndisponivel,
     Item,
     agrupar_capitulos,
@@ -68,6 +71,9 @@ class CogDeTeste(Alertas):
         self.db = database
         self.itens = itens
         self.avisados: list[list[Item]] = []
+        #: Quantos itens de cada aviso "chegam" ao canal. None = todos.
+        self.entrega_ate: int | None = None
+        self.erro_entrega: str | None = None
 
     async def coletar(self, assinatura):
         if isinstance(self.itens, Exception):
@@ -76,6 +82,10 @@ class CogDeTeste(Alertas):
 
     async def notificar(self, assinatura, itens):
         self.avisados.append(list(itens))
+        if self.erro_entrega is None:
+            return Entrega(entregues=tuple(itens))
+        entregues = tuple(itens[: self.entrega_ate or 0])
+        return Entrega(entregues=entregues, erro=self.erro_entrega)
 
 
 async def assinar(database: Database, tipo: str = TIPO_RSS):
@@ -583,3 +593,262 @@ async def test_feed_grande_nao_repete_alerta_na_checagem_seguinte(db):
     await cog.processar(assinatura)
 
     assert cog.avisados == [], "nada do feed original pode voltar como novidade"
+
+
+# ---------------------------------------------------------------------------
+# Entrega: nada some em silêncio
+# ---------------------------------------------------------------------------
+
+
+class CanalFalso(discord.abc.Messageable):
+    """Canal que registra os envios e pode falhar a partir do n-ésimo."""
+
+    def __init__(self, falha_a_partir_de: int | None = None, erro=None) -> None:
+        self.enviados: list[dict] = []
+        self.falha_a_partir_de = falha_a_partir_de
+        self.erro = erro or discord.HTTPException(_RespostaFalsa(), "deu ruim")
+
+    async def _get_channel(self):
+        return self
+
+    async def send(self, **kwargs):
+        if (
+            self.falha_a_partir_de is not None
+            and len(self.enviados) >= self.falha_a_partir_de
+        ):
+            raise self.erro
+        self.enviados.append(kwargs)
+        return None
+
+
+class _RespostaFalsa:
+    status = 500
+    reason = "Internal Server Error"
+
+
+class BotFalso:
+    def __init__(self, canal, pronto: bool = True) -> None:
+        self.canal = canal
+        self.pronto = pronto
+
+    def get_channel(self, channel_id):
+        return self.canal
+
+    def is_ready(self):
+        return self.pronto
+
+    def is_closed(self):
+        return False
+
+
+class CogComCanal(Alertas):
+    """Exercita o notificar() de verdade, com um canal que pode falhar."""
+
+    def __init__(self, database: Database, itens, canal, pronto: bool = True) -> None:
+        self.db = database
+        self.itens = itens
+        self.bot = BotFalso(canal, pronto)
+
+    async def coletar(self, assinatura):
+        if isinstance(self.itens, Exception):
+            raise self.itens
+        return list(self.itens)
+
+
+async def test_envio_que_falha_nao_marca_nada_como_visto(db):
+    """O buraco: item marcado sem ter sido entregue nunca mais vira alerta."""
+    assinatura = await assinar(db)
+    canal = CanalFalso(falha_a_partir_de=0)
+    cog = CogComCanal(db, [item("v1")], canal)
+
+    await cog.processar(assinatura)
+
+    assert canal.enviados == []
+    assert await ids_vistos(db, assinatura.id) == set(), "nada entregue, nada marcado"
+
+
+async def test_envio_que_falha_conta_falha_da_assinatura(db):
+    assinatura = await assinar(db)
+    cog = CogComCanal(db, [item("v1")], CanalFalso(falha_a_partir_de=0))
+
+    await cog.processar(assinatura)
+
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None
+    assert depois.falhas == 1, "a entrega falha entra no backoff"
+    assert depois.proxima_checagem > datetime.now(timezone.utc)
+
+
+async def test_sem_permissao_tambem_conta_como_falha(db):
+    assinatura = await assinar(db)
+    proibido = discord.Forbidden(_RespostaFalsa(), "sem permissão")
+    cog = CogComCanal(db, [item("v1")], CanalFalso(falha_a_partir_de=0, erro=proibido))
+
+    await cog.processar(assinatura)
+
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None and depois.falhas == 1
+    assert await ids_vistos(db, assinatura.id) == set()
+
+
+async def test_checagem_seguinte_reenvia_o_que_faltou(db):
+    assinatura = await assinar(db)
+    canal = CanalFalso(falha_a_partir_de=0)
+    cog = CogComCanal(db, [item("v1")], canal)
+    await cog.processar(assinatura)
+
+    canal.falha_a_partir_de = None  # o canal voltou
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    assert len(canal.enviados) == 1, "o alerta perdido foi reenviado"
+    assert await ids_vistos(db, assinatura.id) == {"v1"}
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None and depois.falhas == 0
+
+
+async def test_entrega_parcial_marca_so_o_que_saiu(db):
+    """Três embeds, o terceiro falha: os dois primeiros já estão no canal."""
+    assinatura = await assinar(db)
+    itens = [item("v3"), item("v2"), item("v1")]  # a fonte devolve do mais novo
+    assert len(itens) <= MAX_EMBEDS_SEPARADOS, "aqui cada item precisa virar um embed"
+    canal = CanalFalso(falha_a_partir_de=2)
+    cog = CogComCanal(db, itens, canal)
+
+    await cog.processar(assinatura)
+
+    assert len(canal.enviados) == 2
+    assert await ids_vistos(db, assinatura.id) == {"v1", "v2"}, (
+        "os avisos saem do mais antigo para o mais novo"
+    )
+
+
+async def test_o_que_ficou_de_fora_da_entrega_parcial_sai_depois(db):
+    assinatura = await assinar(db)
+    canal = CanalFalso(falha_a_partir_de=2)
+    cog = CogComCanal(db, [item("v3"), item("v2"), item("v1")], canal)
+    await cog.processar(assinatura)
+
+    canal.falha_a_partir_de = None
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    assert len(canal.enviados) == 3, "o terceiro alerta foi entregue na volta"
+    assert await ids_vistos(db, assinatura.id) == {"v1", "v2", "v3"}
+
+
+async def test_lote_unico_que_falha_nao_marca_nenhum_item(db):
+    """Acima de três itens vira um embed só: ou tudo chega, ou nada chega."""
+    assinatura = await assinar(db)
+    itens = [item(f"v{n}") for n in range(MAX_EMBEDS_SEPARADOS + 2)]
+    canal = CanalFalso(falha_a_partir_de=0)
+    cog = CogComCanal(db, itens, canal)
+
+    await cog.processar(assinatura)
+
+    assert await ids_vistos(db, assinatura.id) == set()
+
+
+async def test_entrega_completa_marca_tudo_e_zera_falhas(db):
+    assinatura = await assinar(db)
+    canal = CanalFalso()
+    cog = CogComCanal(db, [item("v2"), item("v1")], canal)
+
+    entregues = await cog.processar(assinatura)
+
+    assert [i.id for i in entregues] == ["v1", "v2"]
+    assert await ids_vistos(db, assinatura.id) == {"v1", "v2"}
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None and depois.falhas == 0
+
+
+async def test_canal_apagado_marca_como_visto_para_nao_retentar_para_sempre(db):
+    assinatura = await assinar(db)
+    cog = CogComCanal(db, [item("v1")], canal=None)
+
+    await cog.processar(assinatura)
+
+    assert await ids_vistos(db, assinatura.id) == {"v1"}
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None and depois.falhas == 0, (
+        "canal apagado não é falha da fonte"
+    )
+
+
+async def test_bot_ainda_desconectado_adia_em_vez_de_descartar(db):
+    """Cache frio devolve None para canal que existe; descartar seria perder alerta."""
+    assinatura = await assinar(db)
+    cog = CogComCanal(db, [item("v1")], canal=None, pronto=False)
+
+    await cog.processar(assinatura)
+
+    assert await ids_vistos(db, assinatura.id) == set()
+    depois = await get_assinatura(db, assinatura.id)
+    assert depois is not None and depois.falhas == 1
+
+
+async def test_notificar_devolve_o_que_entregou(db):
+    assinatura = await assinar(db)
+    canal = CanalFalso(falha_a_partir_de=1)
+    cog = CogComCanal(db, [], canal)
+
+    entrega = await cog.notificar(assinatura, [item("a"), item("b")])
+
+    assert [i.id for i in entrega.entregues] == ["a"]
+    assert entrega.ok is False
+    assert entrega.erro and "recusou" in entrega.erro
+
+
+async def test_entrega_sem_erro_e_ok():
+    assert Entrega(entregues=(item("a"),)).ok is True
+    assert Entrega(erro="caiu").ok is False
+
+
+async def test_cargo_e_mencionado_so_na_primeira_mensagem(db):
+    """O ping precisa de AllowedMentions explícito porque o bot usa none()."""
+    assinatura = await criar_assinatura(
+        db,
+        guild_id=GUILD,
+        tipo=TIPO_RSS,
+        externo_id="https://com-cargo/feed",
+        nome="Com cargo",
+        url="",
+        channel_id=CANAL,
+        cargo_id=777,
+    )
+    assert assinatura is not None
+    canal = CanalFalso()
+    cog = CogComCanal(db, [], canal)
+
+    await cog.notificar(assinatura, [item("a"), item("b")])
+
+    primeiro, segundo = canal.enviados
+    assert primeiro["content"] == "<@&777>"
+    assert primeiro["allowed_mentions"].to_dict() == {"roles": [777], "parse": []}
+    assert segundo["content"] is None
+    assert segundo["allowed_mentions"].to_dict() == {"parse": []}
+
+
+async def test_short_descartado_e_marcado_mesmo_sem_entrega(db):
+    """O short não vira aviso, então não há entrega para dar errado."""
+    assinatura = await criar_assinatura(
+        db,
+        guild_id=GUILD,
+        tipo=TIPO_YOUTUBE,
+        externo_id="UCcanal",
+        nome="Canal",
+        url="",
+        channel_id=CANAL,
+        cargo_id=None,
+        opcoes={"ignorar_shorts": True},
+    )
+    assert assinatura is not None
+
+    class CogComShorts(CogComCanal):
+        async def e_short(self, video_id: str) -> bool:
+            return video_id == "short"
+
+    canal = CanalFalso()
+    cog = CogComShorts(db, [item("normal"), item("short")], canal)
+    await cog.processar(assinatura)
+
+    assert await ids_vistos(db, assinatura.id) == {"normal", "short"}
+    assert len(canal.enviados) == 1, "só o vídeo normal virou alerta"
