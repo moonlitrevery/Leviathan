@@ -76,8 +76,9 @@ class LeviathanBot(commands.Bot):
         self.tree.on_error = self.on_app_command_error
 
     @property
-    def dev_guild(self) -> discord.Object:
-        return discord.Object(id=self.config.guild_id)
+    def guild_objects(self) -> tuple[discord.Object, ...]:
+        """Os servidores do ``GUILD_ID``, prontos para a árvore de comandos."""
+        return tuple(discord.Object(id=guild_id) for guild_id in self.config.guild_ids)
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -93,7 +94,7 @@ class LeviathanBot(commands.Bot):
         await init_db(self.db)
 
         await self.load_all_cogs()
-        await self.sync_dev_guild()
+        await self.sync_guilds()
 
     async def load_all_cogs(self) -> list[str]:
         """Carrega todos os cogs da pasta ``cogs``; devolve os carregados com sucesso."""
@@ -118,17 +119,48 @@ class LeviathanBot(commands.Bot):
             log.warning("Nenhum cog carregado de %s", COGS_DIR)
         return loaded
 
-    async def sync_dev_guild(self) -> list[app_commands.AppCommand]:
-        """Copia os comandos globais para a guild de dev e sincroniza.
+    async def sync_guilds(self) -> dict[int, list[app_commands.AppCommand]]:
+        """Copia os comandos globais para cada servidor do ``GUILD_ID`` e sincroniza.
 
         Sync por guild é instantâneo, enquanto o global leva até uma hora para
-        propagar — por isso o desenvolvimento acontece sempre contra uma guild.
+        propagar — por isso os comandos são registrados servidor a servidor, e
+        não globalmente.
+
+        Uma guild que falha não derruba as outras nem o ``setup_hook``: o caso
+        comum é o bot não estar (mais) naquele servidor, ou ter sido convidado
+        sem o escopo ``applications.commands``. Isso é problema de configuração
+        de um servidor, não motivo para o bot não subir.
+
+        Devolve os comandos sincronizados por guild; as que falharam ficam de
+        fora do dicionário.
         """
-        guild = self.dev_guild
-        self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
-        log.info("%d comandos sincronizados na guild %d", len(synced), self.config.guild_id)
-        return synced
+        resultados: dict[int, list[app_commands.AppCommand]] = {}
+        for guild in self.guild_objects:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+            except discord.Forbidden:
+                log.warning(
+                    "Sem permissão para sincronizar comandos na guild %d — o bot"
+                    " precisa ter sido convidado com o escopo applications.commands",
+                    guild.id,
+                )
+            except app_commands.CommandLimitReached as exc:
+                log.warning("Limite de comandos atingido na guild %d: %s", guild.id, exc)
+            except discord.HTTPException as exc:
+                log.warning(
+                    "Falha ao sincronizar os comandos na guild %d: %s", guild.id, exc
+                )
+            else:
+                resultados[guild.id] = synced
+                log.info("%d comandos sincronizados na guild %d", len(synced), guild.id)
+
+        if not resultados:
+            log.warning(
+                "Nenhuma guild sincronizada — os slash commands não vão aparecer."
+                " Confira o GUILD_ID e se o bot está nesses servidores."
+            )
+        return resultados
 
     async def close(self) -> None:
         """Encerra a conexão com o Discord, a sessão HTTP e o pool do banco."""

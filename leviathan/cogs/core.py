@@ -85,11 +85,29 @@ class Core(commands.Cog):
             )
             return
 
-        # Assinaturas de comando podem ter mudado, então re-sincroniza a guild.
-        await self.bot.sync_dev_guild()
+        # Assinaturas de comando podem ter mudado, então re-sincroniza todos os
+        # servidores configurados.
+        sincronizadas = await self.bot.sync_guilds()
+        total = len(self.bot.config.guild_ids)
         log.info("Cog %s recarregado por %s", extension, interaction.user)
+
+        if len(sincronizadas) == total:
+            onde = f"{total} servidor(es)"
+        else:
+            # Falha parcial precisa aparecer para quem rodou o comando: o cog
+            # recarregou, mas em algum servidor os comandos continuam os antigos.
+            faltando = [
+                str(guild_id)
+                for guild_id in self.bot.config.guild_ids
+                if guild_id not in sincronizadas
+            ]
+            onde = (
+                f"{len(sincronizadas)} de {total} servidor(es)"
+                f" — falhou em: {', '.join(faltando)} (veja o log)"
+            )
         await interaction.followup.send(
-            f"Cog `{_short_name(extension)}` recarregado e comandos sincronizados.",
+            f"Cog `{_short_name(extension)}` recarregado e comandos sincronizados"
+            f" em {onde}.",
             ephemeral=True,
         )
 

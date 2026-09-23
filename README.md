@@ -82,9 +82,30 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | Variável | Obrigatória | Descrição |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | sim | Token do bot (aba Bot > Reset Token) |
-| `GUILD_ID` | sim | ID do servidor de desenvolvimento onde os comandos são sincronizados |
+| `GUILD_ID` | sim | Servidor(es) onde os slash commands são sincronizados. Um ID, ou vários separados por vírgula: `123, 456` |
 | `DATABASE_PATH` | não | Caminho do SQLite; padrão `data/leviathan.db` |
 | `LASTFM_API_KEY` | não | Chave da [API da Last.fm](https://www.last.fm/api/account/create). Sem ela, só os comandos `/fm` ficam de fora |
+
+### Vários servidores
+
+`GUILD_ID` aceita uma lista: `GUILD_ID=123456789012345678, 987654321098765432`.
+O bot copia os comandos globais para cada servidor da lista e sincroniza um a
+um — sync por guild aparece na hora, enquanto o sync global do Discord leva até
+uma hora para propagar.
+
+Cada servidor é sincronizado por conta própria: se o bot não estiver em um deles,
+ou tiver sido convidado sem o escopo `applications.commands`, aquele servidor vira
+um WARNING no log e os outros seguem normalmente. O boot não é interrompido por
+isso, porque é problema de configuração de um servidor, não motivo para o bot não
+subir.
+
+O `/reload` também re-sincroniza a lista inteira, e a resposta diz em quantos
+servidores deu certo — se falhar em algum, ele aparece na mensagem, já que ali os
+comandos continuam sendo os antigos.
+
+Os dados continuam separados por servidor: cada tabela tem `guild_id`, então
+gatilhos, contadores, citações, placares e assinaturas de alerta de um servidor
+não aparecem no outro.
 
 ## Comandos
 

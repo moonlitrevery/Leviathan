@@ -23,12 +23,52 @@ class ConfigError(RuntimeError):
     """Configuração ausente ou inválida, com mensagem pronta para o usuário."""
 
 
+def parse_guild_ids(bruto: str) -> tuple[tuple[int, ...], list[str]]:
+    """Interpreta o ``GUILD_ID``: ``(ids, problemas)``.
+
+    Aceita um id sozinho — que é como o arquivo sempre foi usado — ou vários
+    separados por vírgula, com ou sem espaço em volta. Entrada vazia entre
+    vírgulas é ignorada, para que uma vírgula sobrando no fim não vire erro.
+
+    Cada entrada ruim vira um problema próprio, em vez de a primeira abortar a
+    leitura: o mesmo motivo pelo qual :meth:`Config.load` junta tudo antes de
+    reclamar — quem está configurando vê a lista inteira de uma vez.
+    """
+    ids: list[int] = []
+    problemas: list[str] = []
+
+    for entrada in bruto.split(","):
+        entrada = entrada.strip()
+        if not entrada:
+            continue
+        try:
+            valor = int(entrada)
+        except ValueError:
+            problemas.append(
+                f"GUILD_ID: {entrada!r} não é um número inteiro. Use um ID por "
+                "vírgula, como 123456789 ou 123456789, 987654321."
+            )
+            continue
+        if valor <= 0:
+            problemas.append(
+                f"GUILD_ID: {valor} não é um ID válido — IDs do Discord são "
+                "números positivos."
+            )
+            continue
+        # O mesmo servidor listado duas vezes sincronizaria duas vezes à toa.
+        if valor not in ids:
+            ids.append(valor)
+
+    return tuple(ids), problemas
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Configuração validada do bot."""
 
     discord_token: str
-    guild_id: int
+    #: Um ou mais servidores onde os slash commands são sincronizados.
+    guild_ids: tuple[int, ...]
     database_path: Path
     #: Opcional: sem ela o cog lastfm não carrega e o resto do bot sobe normal.
     lastfm_api_key: str | None
@@ -51,25 +91,21 @@ class Config:
                 "https://discord.com/developers/applications (aba Bot > Reset Token)."
             )
 
-        guild_id = 0
+        guild_ids: tuple[int, ...] = ()
         raw_guild = os.getenv("GUILD_ID", "").strip()
         if not raw_guild:
             problems.append(
                 "GUILD_ID não definido — ative o Modo Desenvolvedor no Discord, "
-                "clique com o botão direito no servidor e use 'Copiar ID do servidor'."
+                "clique com o botão direito no servidor e use 'Copiar ID do servidor'. "
+                "Para mais de um servidor, separe os IDs por vírgula."
             )
         else:
-            try:
-                guild_id = int(raw_guild)
-            except ValueError:
+            guild_ids, problemas_guild = parse_guild_ids(raw_guild)
+            problems.extend(problemas_guild)
+            if not guild_ids and not problemas_guild:
                 problems.append(
-                    f"GUILD_ID precisa ser um número inteiro, recebido: {raw_guild!r}."
+                    f"GUILD_ID não tem nenhum ID utilizável, recebido: {raw_guild!r}."
                 )
-            else:
-                if guild_id <= 0:
-                    problems.append(
-                        f"GUILD_ID precisa ser um ID positivo, recebido: {guild_id}."
-                    )
 
         raw_database = os.getenv("DATABASE_PATH", "").strip()
         database_path = Path(raw_database).expanduser() if raw_database else DEFAULT_DATABASE_PATH
@@ -84,7 +120,7 @@ class Config:
 
         return cls(
             discord_token=token,
-            guild_id=guild_id,
+            guild_ids=guild_ids,
             database_path=database_path,
             lastfm_api_key=lastfm_api_key,
         )
