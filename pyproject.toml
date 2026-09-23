@@ -9,6 +9,7 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "discord-py>=2.4",
     "emoji>=2.16.0",
+    "feedparser>=6.0.14",
     "pillow>=12.3.0",
     "python-dotenv>=1.2.3",
 ]

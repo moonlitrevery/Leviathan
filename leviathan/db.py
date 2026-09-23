@@ -286,6 +286,48 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=10,
+        name="alertas",
+        statements=(
+            # Uma assinatura = uma fonte externa avisando num canal do Discord.
+            # opcoes guarda o que varia por tipo (ignorar_shorts, idiomas) como
+            # JSON, para não criar uma coluna por tipo novo de fonte.
+            """
+            CREATE TABLE alertas_assinaturas (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         INTEGER NOT NULL,
+                tipo             TEXT    NOT NULL,
+                externo_id       TEXT    NOT NULL,
+                nome             TEXT    NOT NULL,
+                url              TEXT    NOT NULL DEFAULT '',
+                channel_id       INTEGER NOT NULL,
+                cargo_id         INTEGER,
+                opcoes           TEXT    NOT NULL DEFAULT '{}',
+                ultima_checagem  TEXT,
+                proxima_checagem TEXT    NOT NULL DEFAULT (datetime('now')),
+                falhas           INTEGER NOT NULL DEFAULT 0,
+                criada_em        TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            # A mesma fonte não pode ser assinada duas vezes na mesma guild.
+            "CREATE UNIQUE INDEX idx_alertas_fonte"
+            " ON alertas_assinaturas (guild_id, tipo, externo_id)",
+            "CREATE INDEX idx_alertas_proxima ON alertas_assinaturas (proxima_checagem)",
+            # Dedup do que já foi avisado. Podada para os 200 ids mais recentes
+            # por assinatura, senão um canal antigo carregaria milhares de linhas
+            # para sempre.
+            """
+            CREATE TABLE alertas_vistos (
+                assinatura_id INTEGER NOT NULL
+                              REFERENCES alertas_assinaturas (id) ON DELETE CASCADE,
+                item_id       TEXT    NOT NULL,
+                visto_em      TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (assinatura_id, item_id)
+            )
+            """,
+        ),
+    ),
 )
 
 

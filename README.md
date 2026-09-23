@@ -21,6 +21,7 @@ leviathan/
     quotes.py     # cards de citação em imagem (Pillow)
     lastfm.py     # /fm: tocando, recentes, top e compatibilidade
     quemfalou.py  # jogo de adivinhar o autor de mensagens antigas
+    alertas.py    # avisos de vídeo, capítulo, episódio e RSS novos
   data/
     links.json    # conteúdo dos comandos de links (versionado, editável)
   assets/
@@ -28,10 +29,12 @@ leviathan/
 scripts/
   preview_quote.py  # gera previews do card sem subir o bot
 tests/
+  fixtures/       # feed real do YouTube usado nos testes de alertas
   test_piadas.py  # deduplicação dos contadores e casamento dos gatilhos
   test_quotes.py  # segmentação de emoji e medição do card
   test_lastfm.py  # cálculo de compatibilidade musical
   test_quemfalou.py  # filtro de mensagem, silêncio e um palpite por pessoa
+  test_alertas.py    # parse de feed, agrupamento de capítulos, backoff e poda
 ```
 
 ## Pré-requisitos
@@ -106,6 +109,107 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `/quemfalou agora` | todos (cooldown 30 min) | Dispara uma rodada na hora |
 | `/quemfalou rank` | todos | Placar: pontos, acertos e taxa |
 | `/quemfalou pausar` · `retomar` | Gerenciar servidor | Liga e desliga as rodadas automáticas |
+| `/alerta youtube <canal> [...]` | Gerenciar servidor | Avisa quando sair vídeo novo num canal do YouTube |
+| `/alerta manga <titulo> [...]` | Gerenciar servidor | Avisa quando sair capítulo novo (MangaDex) |
+| `/alerta anime <titulo> [...]` | Gerenciar servidor | Avisa quando um episódio for ao ar (AniList) |
+| `/alerta rss <url> <nome> [...]` | Gerenciar servidor | Avisa quando sair item novo em qualquer feed |
+| `/alerta list` | todos | Assinaturas do servidor, com canal e última checagem |
+| `/alerta remover <assinatura>` | Gerenciar servidor | Cancela uma assinatura |
+| `/alerta testar <assinatura>` | todos | Checa na hora e mostra o item mais recente, sem marcar nada |
+
+## Alertas de conteúdo novo (`/alerta`)
+
+Uma assinatura é uma fonte externa que avisa num canal do Discord. São quatro
+tipos, e nenhum deles precisa de chave de API.
+
+| Tipo | De onde vem | Como identifica o item |
+| --- | --- | --- |
+| YouTube | `youtube.com/feeds/videos.xml?channel_id=UC...` | id do vídeo |
+| Mangá/manhwa | API do MangaDex | número do capítulo |
+| Anime | GraphQL do AniList | número do episódio |
+| RSS | qualquer feed RSS/Atom | guid ou link da entrada |
+
+### A regra que mais importa
+
+**Ao cadastrar uma assinatura, tudo que já está no feed é marcado como visto sem
+notificar.** O feed do YouTube traz sempre os quinze últimos vídeos; sem essa
+carga inicial, assinar um canal despejaria quinze alertas de uma vez no servidor.
+Quem faz isso é `separar_novidades(..., notificar=False)`, e o cadastro responde
+dizendo quantos itens foram silenciados.
+
+Se a fonte estiver fora do ar bem na hora do cadastro, a assinatura é criada
+assim mesmo e fica marcada com `carga_pendente`: a primeira checagem que der
+certo faz o papel da carga inicial, também sem avisar ninguém. Sem essa marca, a
+assinatura criada com a fonte caída despejaria o feed inteiro no tick seguinte —
+justamente o que a regra evita.
+
+### YouTube
+
+O canal pode ser informado como `@handle`, URL ou o id `UC...`. Handle e URL são
+resolvidos baixando a página do canal e lendo o **link canônico** (com
+`<meta itemprop="identifier">` e `"externalId"` como reserva).
+
+Uma armadilha vale registro: o campo `"channelId"` aparece dezenas de vezes no
+HTML da página, e as primeiras ocorrências são de **canais recomendados na barra
+lateral** — usar a primeira faria o bot assinar, calado, um canal que ninguém
+pediu. Há um teste de regressão para isso em `test_alertas.py`.
+
+As requisições ao `youtube.com` levam os cookies `SOCS` e `CONSENT`, que são a
+resposta "já consenti" gravada pelo próprio YouTube. Sem eles, um servidor na
+Europa recebe a tela de consentimento de cookies em vez do canal. Se ainda assim
+o id não for encontrado, o comando explica o que houve e sugere passar o `UC...`
+direto.
+
+Com `ignorar_shorts`, cada vídeo novo leva um `HEAD` em `youtube.com/shorts/<id>`
+sem seguir redirect: **200 é short, redirect (303) não é**. Os shorts descartados
+mesmo assim entram na lista de vistos — se não entrassem, seriam testados de novo
+a cada checagem, para sempre.
+
+### Mangá: um alerta por capítulo, não por upload
+
+O mesmo capítulo existe várias vezes no MangaDex: um upload por idioma e por
+grupo de scan. Notificar por upload encheria o canal de avisos repetidos do mesmo
+capítulo, então `agrupar_capitulos()` agrupa pelo **número do capítulo** e junta
+os idiomas num detalhe só. O link do alerta aponta para o upload mais recente.
+Capítulo sem número (oneshot, extra) cai no id do próprio upload.
+
+As chamadas ao MangaDex passam todas por uma fila com intervalo mínimo de 400 ms
+entre elas, para respeitar o limite de requisições por IP.
+
+### Anime
+
+A agenda de exibição vem de `Page.airingSchedules` na raiz do GraphQL, e **não**
+de `Media.airingSchedule`: o campo dentro de `Media` não aceita `sort`, então só
+pela raiz dá para pedir os episódios já exibidos em ordem decrescente.
+
+### Notificação
+
+Embed com título, link, thumbnail quando houver, nome da fonte e cor por tipo.
+Mais de três itens novos de uma vez viram **um** embed com a lista, em vez de uma
+enxurrada de embeds.
+
+O cargo a mencionar é opcional e por assinatura. Como o bot roda com
+`allowed_mentions=none()` globalmente, o ping só funciona porque o envio passa um
+`AllowedMentions(roles=[cargo])` explícito — com `everyone` e `users` desligados,
+para liberar exatamente aquele cargo e nada mais.
+
+### Agendamento e resiliência
+
+Um `tasks.loop` de 5 minutos procura assinaturas vencidas (no máximo 12 por tick).
+Cada tipo tem seu intervalo mínimo — YouTube 10 min, MangaDex 15, AniList 10,
+RSS 15 — e a próxima checagem ganha até 20% de folga aleatória, para as
+assinaturas não convergirem todas para o mesmo minuto.
+
+Uma fonte que falha nunca derruba o laço: a falha é contada na assinatura e a
+espera dobra a cada tropeço, até o teto de 6 horas (`calcular_backoff`). A partir
+da quinta falha seguida o log sobe para WARNING. Um sucesso zera o contador.
+
+A deduplicação é por `(assinatura, id do item)`, e só os **200 ids mais recentes**
+ficam guardados por assinatura — o suficiente para qualquer feed, sem deixar a
+tabela crescer para sempre. Cada checagem considera no máximo 100 itens, número
+escolhido para caber com folga nesses 200: se uma checagem trouxesse mais itens
+do que cabem na memória de vistos, a poda descartaria os mais antigos e eles
+voltariam a parecer novidade na checagem seguinte.
 
 ## Quem falou? (`/quemfalou`)
 
