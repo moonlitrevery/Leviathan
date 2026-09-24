@@ -72,6 +72,13 @@ class Config:
     database_path: Path
     #: Opcional: sem ela o cog lastfm não carrega e o resto do bot sobe normal.
     lastfm_api_key: str | None
+    #: Opcionais, aos pares: sem os dois, só os alertas de Twitch ficam de fora.
+    twitch_client_id: str | None
+    twitch_client_secret: str | None
+
+    @property
+    def twitch_configurada(self) -> bool:
+        return bool(self.twitch_client_id and self.twitch_client_secret)
 
     @classmethod
     def load(cls, *, env_file: Path | None = None) -> "Config":
@@ -115,6 +122,22 @@ class Config:
         # Opcional de propósito: quem não usa Last.fm não precisa de chave.
         lastfm_api_key = os.getenv("LASTFM_API_KEY", "").strip() or None
 
+        # A Twitch é o único alerta que exige credencial. As duas andam juntas:
+        # com só uma delas preenchida, o mais provável é alguém ter parado no
+        # meio do cadastro, e avisar é melhor do que ignorar calado.
+        twitch_client_id = os.getenv("TWITCH_CLIENT_ID", "").strip() or None
+        twitch_client_secret = os.getenv("TWITCH_CLIENT_SECRET", "").strip() or None
+        if bool(twitch_client_id) != bool(twitch_client_secret):
+            faltando = (
+                "TWITCH_CLIENT_SECRET" if twitch_client_id else "TWITCH_CLIENT_ID"
+            )
+            problems.append(
+                f"{faltando} não definido — os alertas de Twitch precisam do"
+                " Client ID e do Client Secret juntos. Crie uma aplicação em"
+                " https://dev.twitch.tv/console/apps, ou apague as duas variáveis"
+                " para desligar essa fonte."
+            )
+
         if problems:
             raise ConfigError(_format_problems(problems))
 
@@ -123,6 +146,8 @@ class Config:
             guild_ids=guild_ids,
             database_path=database_path,
             lastfm_api_key=lastfm_api_key,
+            twitch_client_id=twitch_client_id,
+            twitch_client_secret=twitch_client_secret,
         )
 
 

@@ -11,6 +11,7 @@ As chamadas HTTP não aparecem: o cog é exercitado por uma subclasse que troca
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,8 +24,10 @@ from leviathan.cogs.alertas import (
     LIMITE_VISTOS,
     MAX_EMBEDS_SEPARADOS,
     TIPO_RSS,
+    TIPO_TWITCH,
     TIPO_YOUTUBE,
     Alertas,
+    Assinatura,
     Entrega,
     FonteIndisponivel,
     Item,
@@ -34,11 +37,14 @@ from leviathan.cogs.alertas import (
     extrair_channel_id,
     get_assinatura,
     ids_vistos,
+    interpretar_alvo_twitch,
     interpretar_alvo_youtube,
+    live_para_item,
     marcar_vistos,
     parse_feed,
     podar_vistos,
     separar_novidades,
+    thumbnail_da_live,
 )
 from leviathan.db import Database, init_db
 
@@ -852,3 +858,434 @@ async def test_short_descartado_e_marcado_mesmo_sem_entrega(db):
 
     assert await ids_vistos(db, assinatura.id) == {"normal", "short"}
     assert len(canal.enviados) == 1, "só o vídeo normal virou alerta"
+
+
+# ---------------------------------------------------------------------------
+# Twitch: o canal informado
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entrada",
+    [
+        "gaules",
+        "@gaules",
+        "Gaules",
+        "twitch.tv/gaules",
+        "www.twitch.tv/gaules",
+        "https://www.twitch.tv/gaules",
+        "https://twitch.tv/gaules/videos",
+        "  gaules  ",
+    ],
+)
+def test_canal_da_twitch_sai_do_que_a_pessoa_digitar(entrada):
+    assert interpretar_alvo_twitch(entrada) == "gaules"
+
+
+@pytest.mark.parametrize("entrada", ["", "ab", "nome com espaço", "!!!", "@"])
+def test_entrada_que_nao_e_canal_da_twitch_e_recusada(entrada):
+    with pytest.raises(FonteIndisponivel):
+        interpretar_alvo_twitch(entrada)
+
+
+# ---------------------------------------------------------------------------
+# Twitch: a live vira item
+# ---------------------------------------------------------------------------
+
+
+def live(id_stream: str = "4242", **campos):
+    base = {
+        "id": id_stream,
+        "title": "CS2 ranked até o topo",
+        "game_name": "Counter-Strike 2",
+        "viewer_count": 1200,
+        "started_at": "2026-09-23T01:00:00Z",
+        "thumbnail_url": "https://x/live_user_gaules-{width}x{height}.jpg",
+    }
+    base.update(campos)
+    return base
+
+
+def test_id_do_item_e_o_da_transmissao():
+    """É isso que faz o aviso sair uma vez por live, e de novo na live seguinte."""
+    assert live_para_item(live("999"), login="gaules").id == "live:999"
+
+
+def test_item_da_live_leva_titulo_jogo_e_audiencia():
+    item = live_para_item(live(), login="gaules")
+
+    assert item.titulo == "CS2 ranked até o topo"
+    assert item.detalhe == "Counter-Strike 2 · 1200 assistindo"
+    assert item.url == "https://www.twitch.tv/gaules"
+    assert item.publicado_em is not None
+
+
+def test_prévia_da_live_troca_os_marcadores_de_tamanho():
+    """Mandar {width}x{height} literal para o Discord renderiza imagem quebrada."""
+    item = live_para_item(live(), login="gaules")
+
+    assert item.thumbnail == "https://x/live_user_gaules-1280x720.jpg"
+    assert "{" not in item.thumbnail
+
+
+def test_previa_sem_marcadores_passa_intacta():
+    assert thumbnail_da_live("https://x/capa.jpg", 1280, 720) == "https://x/capa.jpg"
+
+
+def test_previa_vazia_vira_nada():
+    assert thumbnail_da_live("", 1280, 720) is None
+
+
+def test_live_sem_jogo_nao_deixa_separador_solto():
+    item = live_para_item(live(game_name="", viewer_count=0), login="x")
+
+    assert item.detalhe == ""
+
+
+def test_live_sem_titulo_ainda_rende_um_item_usavel():
+    item = live_para_item(live(title=""), login="x")
+
+    assert item.titulo == "Live"
+
+
+# ---------------------------------------------------------------------------
+# Twitch: um aviso por live
+# ---------------------------------------------------------------------------
+
+
+async def assinar_twitch(database, **opcoes):
+    assinatura = await criar_assinatura(
+        database,
+        guild_id=GUILD,
+        tipo=TIPO_TWITCH,
+        externo_id="123456",
+        nome="Gaules",
+        url="https://www.twitch.tv/gaules",
+        channel_id=CANAL,
+        cargo_id=None,
+        opcoes={"login": "gaules", **opcoes},
+    )
+    assert assinatura is not None
+    return assinatura
+
+
+async def test_canal_offline_no_cadastro_e_avisa_quando_abrir(db):
+    assinatura = await assinar_twitch(db)
+    cog = CogDeTeste(db, [])  # offline
+    await cog.primeira_carga(assinatura)
+
+    cog.itens = [live_para_item(live("111"), login="gaules")]
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    assert [i.id for i in cog.avisados[0]] == ["live:111"]
+
+
+async def test_a_mesma_live_nao_avisa_duas_vezes(db):
+    """A checagem roda de 2 em 2 minutos com a live no ar o tempo todo."""
+    assinatura = await assinar_twitch(db)
+    cog = CogDeTeste(db, [live_para_item(live("111"), login="gaules")])
+    await cog.processar(assinatura)
+
+    await cog.processar(await get_assinatura(db, assinatura.id))
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    assert len(cog.avisados) == 1, "uma live, um aviso"
+
+
+async def test_live_nova_depois_de_fechar_avisa_de_novo(db):
+    assinatura = await assinar_twitch(db)
+    cog = CogDeTeste(db, [live_para_item(live("111"), login="gaules")])
+    await cog.processar(assinatura)
+
+    cog.itens = []  # fechou a live
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    cog.itens = [live_para_item(live("222"), login="gaules")]  # abriu outra
+    await cog.processar(await get_assinatura(db, assinatura.id))
+
+    assert [i.id for lote in cog.avisados for i in lote] == ["live:111", "live:222"]
+
+
+async def test_quem_ja_estava_ao_vivo_no_cadastro_nao_gera_aviso(db):
+    """Mesma regra das outras fontes: assinar não dispara alerta retroativo."""
+    assinatura = await assinar_twitch(db)
+    cog = CogDeTeste(db, [live_para_item(live("111"), login="gaules")])
+
+    await cog.primeira_carga(assinatura)
+
+    assert cog.avisados == []
+    assert await ids_vistos(db, assinatura.id) == {"live:111"}
+
+
+# ---------------------------------------------------------------------------
+# Menções
+# ---------------------------------------------------------------------------
+
+
+def assinatura_com(**campos):
+    base = dict(
+        id=1,
+        guild_id=GUILD,
+        tipo=TIPO_TWITCH,
+        externo_id="123",
+        nome="Gaules",
+        url="",
+        channel_id=CANAL,
+        cargo_id=None,
+        opcoes={},
+    )
+    base.update(campos)
+    return Assinatura(**base)
+
+
+def _mencoes(assinatura):
+    return Alertas.mencoes_da(Alertas.__new__(Alertas), assinatura)
+
+
+def test_everyone_pinga_todo_mundo():
+    conteudo, permitidas = _mencoes(assinatura_com(opcoes={"everyone": True}))
+
+    assert conteudo == "@everyone"
+    assert permitidas.to_dict() == {"parse": ["everyone"]}
+
+
+def test_everyone_e_cargo_convivem():
+    conteudo, permitidas = _mencoes(
+        assinatura_com(opcoes={"everyone": True}, cargo_id=777)
+    )
+
+    assert conteudo == "@everyone <@&777>"
+    assert permitidas.to_dict() == {"roles": [777], "parse": ["everyone"]}
+
+
+def test_so_cargo_nao_libera_everyone():
+    """Regressão: liberar everyone sem pedir furaria a política global do bot."""
+    _, permitidas = _mencoes(assinatura_com(cargo_id=777))
+
+    assert permitidas.to_dict() == {"roles": [777], "parse": []}
+
+
+def test_sem_mencao_nenhuma_o_conteudo_fica_vazio():
+    conteudo, permitidas = _mencoes(assinatura_com())
+
+    assert conteudo is None
+    assert permitidas.to_dict() == {"parse": []}
+
+
+def test_usuarios_nunca_entram_na_liberacao():
+    """Nenhuma combinação pode acabar permitindo ping de usuário."""
+    for opcoes, cargo in (({}, None), ({"everyone": True}, None), ({}, 1), ({"everyone": True}, 1)):
+        _, permitidas = _mencoes(assinatura_com(opcoes=opcoes, cargo_id=cargo))
+        assert "users" not in permitidas.to_dict().get("parse", [])
+
+
+# ---------------------------------------------------------------------------
+# Twitch: token e chamadas à Helix
+#
+# O caminho feliz não dá para exercitar contra a Twitch de verdade sem uma
+# credencial válida, então a sessão HTTP é dublê. O que está coberto é o que é
+# nosso: cache do token, renovação no 401 e tradução das respostas.
+# ---------------------------------------------------------------------------
+
+
+class RespostaFalsa:
+    def __init__(self, status: int, payload) -> None:
+        self.status = status
+        self._payload = payload
+
+    async def json(self, content_type=None):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+
+class SessaoFalsa:
+    """Devolve respostas roteirizadas e guarda o que foi pedido."""
+
+    def __init__(self, tokens=None, gets=None) -> None:
+        self.tokens = list(tokens or [])
+        self.gets = list(gets or [])
+        self.posts_feitos: list[dict] = []
+        self.gets_feitos: list[tuple] = []
+        self.closed = False
+
+    def post(self, url, data=None, timeout=None):
+        self.posts_feitos.append(dict(data or {}))
+        return self.tokens.pop(0)
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.gets_feitos.append((url, params, dict(headers or {})))
+        return self.gets.pop(0)
+
+
+def cog_twitch(sessao, *, configurada: bool = True):
+    from types import SimpleNamespace
+
+    cog = Alertas.__new__(Alertas)
+    cog.bot = SimpleNamespace(
+        http_session=sessao,
+        config=SimpleNamespace(
+            twitch_client_id="cid" if configurada else None,
+            twitch_client_secret="segredo" if configurada else None,
+            twitch_configurada=configurada,
+        ),
+    )
+    cog._trava_twitch = asyncio.Lock()
+    cog._token_twitch = None
+    cog._token_twitch_expira = datetime.min.replace(tzinfo=timezone.utc)
+    return cog
+
+
+def token_ok(segundos: int = 5_000_000, valor: str = "tok-123"):
+    return RespostaFalsa(200, {"access_token": valor, "expires_in": segundos})
+
+
+async def test_token_vai_no_corpo_como_a_twitch_pede():
+    """client_id/secret/grant_type vão no corpo do POST, não na query."""
+    sessao = SessaoFalsa(tokens=[token_ok()])
+    cog = cog_twitch(sessao)
+
+    assert await cog.token_twitch() == "tok-123"
+    assert sessao.posts_feitos[0] == {
+        "client_id": "cid",
+        "client_secret": "segredo",
+        "grant_type": "client_credentials",
+    }
+
+
+async def test_token_fica_em_cache_entre_chamadas():
+    """Ele vale semanas; pedir um por checagem seria desperdício."""
+    sessao = SessaoFalsa(tokens=[token_ok()])
+    cog = cog_twitch(sessao)
+
+    await cog.token_twitch()
+    await cog.token_twitch()
+
+    assert len(sessao.posts_feitos) == 1
+
+
+async def test_token_perto_de_vencer_e_renovado():
+    """A margem existe para a checagem não cair no instante da virada."""
+    sessao = SessaoFalsa(tokens=[token_ok(segundos=60), token_ok(valor="tok-novo")])
+    cog = cog_twitch(sessao)
+
+    await cog.token_twitch()
+    assert await cog.token_twitch() == "tok-novo"
+
+
+async def test_credencial_recusada_vira_mensagem_util():
+    sessao = SessaoFalsa(tokens=[RespostaFalsa(400, {"message": "invalid client"})])
+    cog = cog_twitch(sessao)
+
+    with pytest.raises(FonteIndisponivel) as erro:
+        await cog.token_twitch()
+
+    assert "TWITCH_CLIENT_ID" in str(erro.value)
+
+
+async def test_sem_credencial_a_mensagem_ensina_o_caminho():
+    cog = cog_twitch(SessaoFalsa(), configurada=False)
+
+    with pytest.raises(FonteIndisponivel) as erro:
+        await cog.token_twitch()
+
+    assert "dev.twitch.tv" in str(erro.value)
+
+
+async def test_chamada_manda_client_id_e_bearer():
+    sessao = SessaoFalsa(tokens=[token_ok()], gets=[RespostaFalsa(200, {"data": []})])
+    cog = cog_twitch(sessao)
+
+    await cog.twitch("/streams", [("user_id", "1")])
+
+    _, _, cabecalhos = sessao.gets_feitos[0]
+    assert cabecalhos["Client-Id"] == "cid"
+    assert cabecalhos["Authorization"] == "Bearer tok-123"
+
+
+async def test_token_revogado_e_renovado_uma_vez():
+    """401 no meio do caminho não pode virar falha da assinatura."""
+    sessao = SessaoFalsa(
+        tokens=[token_ok(), token_ok(valor="tok-novo")],
+        gets=[RespostaFalsa(401, {}), RespostaFalsa(200, {"data": [live("7")]})],
+    )
+    cog = cog_twitch(sessao)
+
+    dados = await cog.twitch("/streams", [("user_id", "1")])
+
+    assert dados["data"][0]["id"] == "7"
+    assert len(sessao.posts_feitos) == 2, "o token foi renovado"
+    assert sessao.gets_feitos[1][2]["Authorization"] == "Bearer tok-novo"
+
+
+async def test_401_duas_vezes_desiste_sem_laco_infinito():
+    sessao = SessaoFalsa(
+        tokens=[token_ok(), token_ok()],
+        gets=[RespostaFalsa(401, {}), RespostaFalsa(401, {})],
+    )
+    cog = cog_twitch(sessao)
+
+    with pytest.raises(FonteIndisponivel):
+        await cog.twitch("/streams", [("user_id", "1")])
+
+
+async def test_rate_limit_da_twitch_e_traduzido():
+    sessao = SessaoFalsa(tokens=[token_ok()], gets=[RespostaFalsa(429, {})])
+    cog = cog_twitch(sessao)
+
+    with pytest.raises(FonteIndisponivel) as erro:
+        await cog.twitch("/streams", [("user_id", "1")])
+
+    assert "limitando" in str(erro.value)
+
+
+async def test_coletar_traduz_a_live_em_item():
+    sessao = SessaoFalsa(
+        tokens=[token_ok()], gets=[RespostaFalsa(200, {"data": [live("55")]})]
+    )
+    cog = cog_twitch(sessao)
+    assinatura = assinatura_com(externo_id="123", opcoes={"login": "gaules"})
+
+    itens = await cog.coletar(assinatura)
+
+    assert [i.id for i in itens] == ["live:55"]
+    assert sessao.gets_feitos[0][1] == [("user_id", "123")]
+
+
+async def test_coletar_de_canal_offline_nao_rende_item():
+    """Offline é lista vazia na Helix; nada a avisar, e nenhuma falha."""
+    sessao = SessaoFalsa(tokens=[token_ok()], gets=[RespostaFalsa(200, {"data": []})])
+    cog = cog_twitch(sessao)
+
+    assert await cog.coletar(assinatura_com(opcoes={"login": "x"})) == []
+
+
+async def test_resolver_canal_guarda_o_id_e_nao_o_login():
+    """Quem troca o nome do canal na Twitch continua sendo o mesmo id."""
+    sessao = SessaoFalsa(
+        tokens=[token_ok()],
+        gets=[
+            RespostaFalsa(
+                200, {"data": [{"id": "9876", "login": "gaules", "display_name": "Gaules"}]}
+            )
+        ],
+    )
+    cog = cog_twitch(sessao)
+
+    assert await cog.resolver_twitch("twitch.tv/Gaules") == ("9876", "Gaules", "gaules")
+
+
+async def test_canal_inexistente_avisa_em_vez_de_cadastrar_vazio():
+    sessao = SessaoFalsa(tokens=[token_ok()], gets=[RespostaFalsa(200, {"data": []})])
+    cog = cog_twitch(sessao)
+
+    with pytest.raises(FonteIndisponivel) as erro:
+        await cog.resolver_twitch("ninguem_aqui")
+
+    assert "ninguem_aqui" in str(erro.value)

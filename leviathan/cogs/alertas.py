@@ -44,12 +44,14 @@ TIPO_YOUTUBE = "youtube"
 TIPO_MANGA = "manga"
 TIPO_ANIME = "anime"
 TIPO_RSS = "rss"
+TIPO_TWITCH = "twitch"
 
 ROTULOS = {
     TIPO_YOUTUBE: "YouTube",
     TIPO_MANGA: "Mangá",
     TIPO_ANIME: "Anime",
     TIPO_RSS: "RSS",
+    TIPO_TWITCH: "Twitch",
 }
 
 CORES = {
@@ -57,18 +59,25 @@ CORES = {
     TIPO_MANGA: discord.Color.from_str("#ff6740"),
     TIPO_ANIME: discord.Color.from_str("#02a9ff"),
     TIPO_RSS: discord.Color.from_str("#ee802f"),
+    TIPO_TWITCH: discord.Color.from_str("#9146ff"),
 }
 
 #: Intervalo mínimo entre duas checagens da mesma assinatura.
+#: A Twitch é a mais curta porque é a única em que o atraso estraga o aviso:
+#: "fulano abriu live" meia hora depois não serve para ninguém entrar.
 INTERVALOS = {
     TIPO_YOUTUBE: timedelta(minutes=10),
     TIPO_MANGA: timedelta(minutes=15),
     TIPO_ANIME: timedelta(minutes=10),
     TIPO_RSS: timedelta(minutes=15),
+    TIPO_TWITCH: timedelta(minutes=2),
 }
 
-#: De quanto em quanto tempo o laço procura assinaturas vencidas.
-TICK = timedelta(minutes=5)
+#: De quanto em quanto tempo o laço procura assinaturas vencidas. É o piso da
+#: pontualidade de qualquer alerta: com tick de 5 minutos, uma live demoraria
+#: isso para ser percebida mesmo com o intervalo da Twitch em 2 minutos. O tique
+#: em si é barato — quase sempre é uma consulta ao banco que não devolve nada.
+TICK = timedelta(minutes=1)
 
 #: Teto do backoff: mesmo uma fonte morta há dias volta a ser tentada de 6 em 6h.
 BACKOFF_MAX = timedelta(hours=6)
@@ -84,6 +93,12 @@ LIMITE_VISTOS = 200
 #: memória de vistos, a poda jogaria fora os mais antigos e eles voltariam a
 #: parecer novidade na checagem seguinte, virando alerta repetido.
 LIMITE_ITENS = 100
+
+#: Nome do campo extra do embed, que quer dizer coisas diferentes por fonte.
+ROTULO_DETALHE = {
+    TIPO_MANGA: "Idiomas",
+    TIPO_TWITCH: "Agora",
+}
 
 #: Acima disso, os itens novos viram um embed só com a lista.
 MAX_EMBEDS_SEPARADOS = 3
@@ -112,6 +127,20 @@ IDIOMA_CHOICES = [
 YOUTUBE_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
 MANGADEX_API = "https://api.mangadex.org"
 ANILIST_API = "https://graphql.anilist.co"
+TWITCH_API = "https://api.twitch.tv/helix"
+TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+
+#: Margem de segurança do token da Twitch: ele é renovado um pouco antes de
+#: vencer, para uma checagem não cair bem no instante da virada.
+TWITCH_MARGEM_TOKEN = timedelta(minutes=5)
+
+#: Tamanho pedido para a prévia da live. A URL vem com {width} e {height} para
+#: quem chama substituir.
+TWITCH_THUMB = (1280, 720)
+
+#: Aceita "fulano", "@fulano", "twitch.tv/fulano" e a URL inteira. O login da
+#: Twitch é de 4 a 25 caracteres, letras, números e underscore.
+TWITCH_LOGIN_RE = re.compile(r"^[A-Za-z0-9_]{4,25}$")
 
 #: Alguns servidores europeus recebem a página de consentimento de cookies em
 #: vez do canal. Esses dois cookies são a resposta "já consenti" que o próprio
@@ -321,6 +350,71 @@ def interpretar_alvo_youtube(texto: str) -> tuple[str, str]:
         return "pagina", f"https://www.youtube.com/@{texto}"
     raise FonteIndisponivel(
         "Não reconheci esse canal. Use o @handle, a URL do canal ou o id que começa com UC."
+    )
+
+
+def interpretar_alvo_twitch(texto: str) -> str:
+    """O login do canal, a partir do que a pessoa digitou.
+
+    Aceita ``fulano``, ``@fulano``, ``twitch.tv/fulano`` e a URL inteira, com ou
+    sem ``https://``. O login é normalizado para minúsculas porque é assim que a
+    Twitch o trata, e é ele que vai para a API.
+    """
+    alvo = texto.strip()
+    if "twitch.tv" in alvo.lower():
+        endereco = alvo if "://" in alvo else f"https://{alvo}"
+        caminho = urlparse(endereco).path.strip("/")
+        # A URL pode ser twitch.tv/fulano ou twitch.tv/fulano/videos.
+        alvo = caminho.split("/")[0] if caminho else ""
+    alvo = alvo.lstrip("@").strip()
+
+    if not TWITCH_LOGIN_RE.match(alvo):
+        raise FonteIndisponivel(
+            f"{texto.strip()!r} não parece um canal da Twitch. Use o nome do canal"
+            " (como `gaules`) ou a URL (como `twitch.tv/gaules`)."
+        )
+    return alvo.lower()
+
+
+def thumbnail_da_live(url: str, largura: int, altura: int) -> str | None:
+    """Troca os marcadores ``{width}``/``{height}`` da prévia pelo tamanho real.
+
+    A Twitch devolve a URL com os dois marcadores literais; mandar isso direto
+    para o Discord renderiza uma imagem quebrada. Se um dia ela parar de usar
+    marcadores, a URL passa intacta.
+    """
+    if not url:
+        return None
+    return url.replace("{width}", str(largura)).replace("{height}", str(altura))
+
+
+def live_para_item(stream: dict[str, Any], *, login: str) -> Item:
+    """A live atual vira o item que dispara o alerta.
+
+    O id do item é o **id da transmissão**, não o do canal: é isso que faz o
+    aviso sair uma vez por live. Enquanto a mesma transmissão estiver no ar, as
+    checagens seguintes veem um id já visto e ficam caladas; quando o streamer
+    fecha e abre de novo, a Twitch dá um id novo e o alerta volta a sair.
+    """
+    titulo = str(stream.get("title") or "").strip() or "Live"
+    jogo = str(stream.get("game_name") or "").strip()
+    espectadores = stream.get("viewer_count")
+
+    detalhes = []
+    if jogo:
+        detalhes.append(jogo)
+    if isinstance(espectadores, int) and espectadores > 0:
+        detalhes.append(f"{espectadores} assistindo")
+
+    return Item(
+        id=f"live:{stream.get('id')}",
+        titulo=titulo,
+        url=f"https://www.twitch.tv/{login}",
+        thumbnail=thumbnail_da_live(
+            str(stream.get("thumbnail_url") or ""), *TWITCH_THUMB
+        ),
+        publicado_em=_iso_para_data(stream.get("started_at")),
+        detalhe=" · ".join(detalhes),
     )
 
 
@@ -697,6 +791,12 @@ class Alertas(commands.Cog):
         # aqui, em fila, com um intervalo mínimo entre elas.
         self._trava_mangadex = asyncio.Lock()
         self._ultima_mangadex = float("-inf")
+        # Token de aplicação da Twitch: vale semanas, então fica em memória e é
+        # renovado sob demanda. A trava evita que várias assinaturas vencendo no
+        # mesmo tique peçam um token cada.
+        self._trava_twitch = asyncio.Lock()
+        self._token_twitch: str | None = None
+        self._token_twitch_expira = datetime.min.replace(tzinfo=timezone.utc)
 
     async def cog_load(self) -> None:
         self.ciclo.start()
@@ -751,6 +851,124 @@ class Alertas(commands.Cog):
                 raise FonteIndisponivel("O MangaDex demorou demais para responder.") from exc
             finally:
                 self._ultima_mangadex = time.monotonic()
+
+    # -- Twitch ------------------------------------------------------------
+
+    @property
+    def twitch_configurada(self) -> bool:
+        return self.bot.config.twitch_configurada
+
+    def _exigir_twitch(self) -> None:
+        if not self.twitch_configurada:
+            raise FonteIndisponivel(
+                "Os alertas de Twitch precisam de TWITCH_CLIENT_ID e"
+                " TWITCH_CLIENT_SECRET no .env. Crie uma aplicação em"
+                " https://dev.twitch.tv/console/apps (qualquer URL de redirect"
+                " serve, o bot não usa login de usuário)."
+            )
+
+    async def token_twitch(self, *, renovar: bool = False) -> str:
+        """Token de aplicação, buscado só quando falta ou está para vencer."""
+        self._exigir_twitch()
+        async with self._trava_twitch:
+            agora = datetime.now(timezone.utc)
+            if (
+                not renovar
+                and self._token_twitch
+                and agora < self._token_twitch_expira - TWITCH_MARGEM_TOKEN
+            ):
+                return self._token_twitch
+
+            dados = {
+                "client_id": self.bot.config.twitch_client_id,
+                "client_secret": self.bot.config.twitch_client_secret,
+                "grant_type": "client_credentials",
+            }
+            try:
+                async with self.sessao.post(
+                    TWITCH_TOKEN_URL, data=dados, timeout=TIMEOUT_FEED
+                ) as resposta:
+                    corpo = await resposta.json(content_type=None)
+                    if resposta.status != 200:
+                        # 400 "invalid client" é o que a Twitch responde para
+                        # credencial errada; vale dizer isso em vez de "deu erro".
+                        motivo = (corpo or {}).get("message", resposta.status)
+                        raise FonteIndisponivel(
+                            f"A Twitch recusou as credenciais ({motivo}). Confira"
+                            " TWITCH_CLIENT_ID e TWITCH_CLIENT_SECRET no .env."
+                        )
+            except aiohttp.ClientError as exc:
+                raise FonteIndisponivel(f"Não consegui falar com a Twitch: {exc}") from exc
+            except asyncio.TimeoutError as exc:
+                raise FonteIndisponivel("A Twitch demorou demais para responder.") from exc
+            except ValueError as exc:
+                raise FonteIndisponivel("A Twitch devolveu uma resposta ilegível.") from exc
+
+            self._token_twitch = str(corpo.get("access_token") or "")
+            segundos = int(corpo.get("expires_in") or 0)
+            self._token_twitch_expira = agora + timedelta(seconds=segundos)
+            if not self._token_twitch:
+                raise FonteIndisponivel("A Twitch não devolveu token de acesso.")
+            log.info("Token da Twitch renovado, válido por %d dia(s)", segundos // 86400)
+            return self._token_twitch
+
+    async def twitch(self, caminho: str, params: Any) -> dict[str, Any]:
+        """GET na Helix. Um 401 renova o token e tenta de novo, uma vez só."""
+        for tentativa in (1, 2):
+            token = await self.token_twitch(renovar=tentativa == 2)
+            cabecalhos = {
+                "Client-Id": str(self.bot.config.twitch_client_id),
+                "Authorization": f"Bearer {token}",
+            }
+            try:
+                async with self.sessao.get(
+                    f"{TWITCH_API}{caminho}",
+                    params=params,
+                    headers=cabecalhos,
+                    timeout=TIMEOUT_FEED,
+                ) as resposta:
+                    if resposta.status == 401 and tentativa == 1:
+                        # Token revogado antes da hora: vale uma segunda tentativa.
+                        log.info("Token da Twitch recusado; renovando")
+                        continue
+                    if resposta.status == 429:
+                        raise FonteIndisponivel(
+                            "A Twitch está limitando as requisições. Tente em instantes."
+                        )
+                    if resposta.status != 200:
+                        corpo = await resposta.json(content_type=None)
+                        motivo = (corpo or {}).get("message", "") if isinstance(corpo, dict) else ""
+                        raise FonteIndisponivel(
+                            f"A Twitch respondeu HTTP {resposta.status}. {motivo}".strip()
+                        )
+                    return await resposta.json(content_type=None)
+            except aiohttp.ClientError as exc:
+                raise FonteIndisponivel(f"Não consegui falar com a Twitch: {exc}") from exc
+            except asyncio.TimeoutError as exc:
+                raise FonteIndisponivel("A Twitch demorou demais para responder.") from exc
+            except ValueError as exc:
+                raise FonteIndisponivel("A Twitch devolveu uma resposta ilegível.") from exc
+        raise FonteIndisponivel("A Twitch recusou o token duas vezes seguidas.")
+
+    async def resolver_twitch(self, alvo: str) -> tuple[str, str, str]:
+        """``(user_id, nome de exibição, login)`` do canal.
+
+        O que fica guardado é o **id numérico**, não o login: quem muda o nome do
+        canal na Twitch continua sendo o mesmo id, e a assinatura sobrevive.
+        """
+        login = interpretar_alvo_twitch(alvo)
+        dados = await self.twitch("/users", [("login", login)])
+        usuarios = dados.get("data") or []
+        if not usuarios:
+            raise FonteIndisponivel(
+                f"Não achei o canal `{login}` na Twitch. Confira o nome."
+            )
+        usuario = usuarios[0]
+        return (
+            str(usuario["id"]),
+            str(usuario.get("display_name") or login),
+            str(usuario.get("login") or login),
+        )
 
     async def anilist(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -859,6 +1077,13 @@ class Alertas(commands.Cog):
             params += [("translatedLanguage[]", idioma) for idioma in idiomas]
             dados = await self.mangadex(f"/manga/{assinatura.externo_id}/feed", params)
             return agrupar_capitulos(dados.get("data") or [])
+        if assinatura.tipo == TIPO_TWITCH:
+            dados = await self.twitch("/streams", [("user_id", assinatura.externo_id)])
+            transmissoes = dados.get("data") or []
+            if not transmissoes:
+                return []  # offline: nada a avisar
+            login = assinatura.opcoes.get("login") or assinatura.nome.lower()
+            return [live_para_item(transmissoes[0], login=login)]
         if assinatura.tipo == TIPO_ANIME:
             agora = int(time.time())
             dados = await self.anilist(
@@ -1037,11 +1262,23 @@ class Alertas(commands.Cog):
             color=CORES.get(assinatura.tipo, discord.Color.blurple()),
             timestamp=item.publicado_em,
         )
-        embed.set_author(name=_cortar(f"{assinatura.rotulo} · {assinatura.nome}", 256))
+        if assinatura.tipo == TIPO_TWITCH:
+            # O que interessa numa live é o "está ao vivo agora", não o nome da
+            # fonte: o autor do embed é a manchete.
+            embed.set_author(
+                name=_cortar(f"🔴 {assinatura.nome} está ao vivo na Twitch", 256)
+            )
+        else:
+            embed.set_author(
+                name=_cortar(f"{assinatura.rotulo} · {assinatura.nome}", 256)
+            )
         if item.thumbnail:
             embed.set_image(url=item.thumbnail)
         if item.detalhe:
-            embed.add_field(name="Idiomas", value=_cortar(item.detalhe, 1024))
+            embed.add_field(
+                name=ROTULO_DETALHE.get(assinatura.tipo, "Detalhes"),
+                value=_cortar(item.detalhe, 1024),
+            )
         return embed
 
     def embed_do_lote(self, assinatura: Assinatura, itens: list[Item]) -> discord.Embed:
@@ -1086,6 +1323,34 @@ class Alertas(commands.Cog):
             return [(self.embed_do_lote(assinatura, itens), list(itens))]
         return [(self.embed_do_item(assinatura, item), [item]) for item in itens]
 
+    def mencoes_da(
+        self, assinatura: Assinatura
+    ) -> tuple[str | None, discord.AllowedMentions]:
+        """``(conteúdo da mensagem, quem pode ser pingado)``.
+
+        O bot roda com ``allowed_mentions=none()`` global, então escrever
+        ``@everyone`` no texto não basta: o ping só sai se este envio liberar
+        explicitamente. O que não foi pedido continua desligado — nada de
+        ``users=True`` por tabela.
+        """
+        everyone = bool(assinatura.opcoes.get("everyone"))
+        cargo_id = assinatura.cargo_id
+
+        mencoes = []
+        if everyone:
+            mencoes.append("@everyone")
+        if cargo_id:
+            mencoes.append(f"<@&{cargo_id}>")
+        if not mencoes:
+            return None, discord.AllowedMentions.none()
+
+        return " ".join(mencoes), discord.AllowedMentions(
+            everyone=everyone,
+            users=False,
+            replied_user=False,
+            roles=[discord.Object(id=cargo_id)] if cargo_id else False,
+        )
+
     async def notificar(self, assinatura: Assinatura, itens: list[Item]) -> Entrega:
         """Envia os alertas e conta o que de fato saiu.
 
@@ -1109,21 +1374,7 @@ class Alertas(commands.Cog):
             )
             return Entrega(entregues=tuple(itens))
 
-        conteudo = None
-        # O bot usa allowed_mentions=none() globalmente, então o ping só sai se
-        # este send liberar explicitamente o cargo.
-        permitidas = discord.AllowedMentions.none()
-        if assinatura.cargo_id:
-            conteudo = f"<@&{assinatura.cargo_id}>"
-            # Só este cargo: everyone e users ficam desligados de propósito,
-            # senão o payload voltaria a permitir o que a política global do bot
-            # bloqueia.
-            permitidas = discord.AllowedMentions(
-                everyone=False,
-                users=False,
-                replied_user=False,
-                roles=[discord.Object(id=assinatura.cargo_id)],
-            )
+        conteudo, permitidas = self.mencoes_da(assinatura)
 
         entregues: list[Item] = []
         for posicao, (embed, cobertos) in enumerate(
@@ -1221,6 +1472,8 @@ class Alertas(commands.Cog):
                 legiveis.append("ignorando Shorts")
             if opcoes.get("idiomas"):
                 legiveis.append("idiomas: " + ", ".join(opcoes["idiomas"]))
+            if opcoes.get("everyone"):
+                legiveis.append("marcando @everyone")
             if legiveis:
                 embed.add_field(name="Opções", value="; ".join(legiveis), inline=False)
         embed.set_footer(
@@ -1373,6 +1626,58 @@ class Alertas(commands.Cog):
             return dados.get("Media")
         resultados = await self.buscar_animes(alvo)
         return resultados[0] if resultados else None
+
+    @alerta.command(name="twitch", description="Avisa quando um canal abrir live.")
+    @app_commands.describe(
+        canal="Nome do canal ou URL (ex: gaules ou twitch.tv/gaules)",
+        canal_discord="Onde avisar (padrão: este canal)",
+        everyone="Marcar @everyone no aviso (padrão: sim)",
+        cargo="Cargo a mencionar, além ou no lugar do @everyone",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def cmd_twitch(
+        self,
+        interaction: discord.Interaction,
+        canal: str,
+        canal_discord: discord.TextChannel | None = None,
+        everyone: bool = True,
+        cargo: discord.Role | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        destino = await self._destino(interaction, canal_discord)
+        if destino is None:
+            return
+
+        try:
+            user_id, nome, login = await self.resolver_twitch(canal)
+        except FonteIndisponivel as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        if everyone:
+            # O @everyone é permissão à parte: sem ela o Discord entrega a
+            # mensagem mas não pinga ninguém, e o aviso passaria batido.
+            permissoes = destino.permissions_for(destino.guild.me)
+            if not permissoes.mention_everyone:
+                await interaction.followup.send(
+                    f"Eu não tenho a permissão 'Mencionar @everyone, @here e todos"
+                    f" os cargos' em {destino.mention}. Sem ela o aviso sai, mas o"
+                    " @everyone não pinga ninguém. Ajuste a permissão e rode de"
+                    " novo, ou use `everyone: False`.",
+                    ephemeral=True,
+                )
+                return
+
+        await self._cadastrar(
+            interaction,
+            tipo=TIPO_TWITCH,
+            externo_id=user_id,
+            nome=nome,
+            url=f"https://www.twitch.tv/{login}",
+            canal=destino,
+            cargo=cargo,
+            opcoes={"login": login, "everyone": bool(everyone)},
+        )
 
     @alerta.command(name="rss", description="Avisa quando sair item novo num feed.")
     @app_commands.describe(

@@ -85,6 +85,7 @@ aplicadas, os cogs carregados e a quantidade de comandos sincronizados.
 | `GUILD_ID` | sim | Servidor(es) onde os slash commands são sincronizados. Um ID, ou vários separados por vírgula: `123, 456` |
 | `DATABASE_PATH` | não | Caminho do SQLite; padrão `data/leviathan.db` |
 | `LASTFM_API_KEY` | não | Chave da [API da Last.fm](https://www.last.fm/api/account/create). Sem ela, só os comandos `/fm` ficam de fora |
+| `TWITCH_CLIENT_ID` · `TWITCH_CLIENT_SECRET` | não | Credenciais de uma app em [dev.twitch.tv](https://dev.twitch.tv/console/apps), para os alertas de live. Valem as duas juntas ou nenhuma |
 
 ### Vários servidores
 
@@ -141,6 +142,7 @@ não aparecem no outro.
 | `/alerta youtube <canal> [...]` | Gerenciar servidor | Avisa quando sair vídeo novo num canal do YouTube |
 | `/alerta manga <titulo> [...]` | Gerenciar servidor | Avisa quando sair capítulo novo (MangaDex) |
 | `/alerta anime <titulo> [...]` | Gerenciar servidor | Avisa quando um episódio for ao ar (AniList) |
+| `/alerta twitch <canal> [...]` | Gerenciar servidor | Avisa quando um canal abrir live, marcando `@everyone` por padrão |
 | `/alerta rss <url> <nome> [...]` | Gerenciar servidor | Avisa quando sair item novo em qualquer feed |
 | `/alerta list` | todos | Assinaturas do servidor, com canal e última checagem |
 | `/alerta remover <assinatura>` | Gerenciar servidor | Cancela uma assinatura |
@@ -148,15 +150,16 @@ não aparecem no outro.
 
 ## Alertas de conteúdo novo (`/alerta`)
 
-Uma assinatura é uma fonte externa que avisa num canal do Discord. São quatro
-tipos, e nenhum deles precisa de chave de API.
+Uma assinatura é uma fonte externa que avisa num canal do Discord. São cinco
+tipos; só a Twitch precisa de credencial.
 
-| Tipo | De onde vem | Como identifica o item |
-| --- | --- | --- |
-| YouTube | `youtube.com/feeds/videos.xml?channel_id=UC...` | id do vídeo |
-| Mangá/manhwa | API do MangaDex | número do capítulo |
-| Anime | GraphQL do AniList | número do episódio |
-| RSS | qualquer feed RSS/Atom | guid ou link da entrada |
+| Tipo | De onde vem | Como identifica o item | Precisa de chave? |
+| --- | --- | --- | --- |
+| YouTube | `youtube.com/feeds/videos.xml?channel_id=UC...` | id do vídeo | não |
+| Mangá/manhwa | API do MangaDex | número do capítulo | não |
+| Anime | GraphQL do AniList | número do episódio | não |
+| RSS | qualquer feed RSS/Atom | guid ou link da entrada | não |
+| Twitch | Helix (`api.twitch.tv`) | id da transmissão | **sim** |
 
 ### A regra que mais importa
 
@@ -194,6 +197,52 @@ sem seguir redirect: **200 é short, redirect (303) não é**. Os shorts descart
 mesmo assim entram na lista de vistos — se não entrassem, seriam testados de novo
 a cada checagem, para sempre.
 
+### Twitch: avisa quando abrir live
+
+```
+/alerta twitch canal:gaules
+/alerta twitch canal:twitch.tv/alanzoka canal_discord:#avisos everyone:False
+```
+
+O canal pode ser o nome (`gaules`), com arroba (`@gaules`) ou a URL
+(`twitch.tv/gaules`). O que fica guardado é o **id numérico** do canal, não o
+login: quem muda o nome na Twitch continua sendo o mesmo id, e a assinatura
+sobrevive.
+
+**O aviso marca `@everyone` por padrão** (`everyone:False` desliga). Como o bot
+roda com `allowed_mentions=none()` global, o ping só sai porque o envio libera
+`everyone` explicitamente — e nada além disso: menção de usuário nunca é
+liberada, em nenhuma combinação. O cadastro confere antes se o bot tem a
+permissão *Mencionar @everyone* no canal de destino e recusa com uma explicação
+se não tiver, porque sem ela o Discord entrega a mensagem e simplesmente não
+pinga ninguém.
+
+A identidade do item é o **id da transmissão**, não o do canal. É isso que faz o
+aviso sair uma vez por live: enquanto a mesma transmissão está no ar, as
+checagens seguintes veem um id já visto e ficam caladas; quando o streamer fecha
+e abre de novo, a Twitch dá um id novo e o alerta volta a sair. Canal offline
+devolve lista vazia na Helix, o que é simplesmente "nada a avisar" — não conta
+como falha.
+
+Vale a mesma regra do cadastro das outras fontes: **quem já estava ao vivo na
+hora em que foi assinado não gera alerta**. O aviso é para quem *abriu* a live.
+
+#### Credenciais
+
+Crie uma aplicação em [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps)
+e preencha `TWITCH_CLIENT_ID` e `TWITCH_CLIENT_SECRET`. Qualquer URL de redirect
+serve, porque o bot usa **app access token** (fluxo `client_credentials`), não
+login de usuário — ele só lê dados públicos.
+
+O token vale semanas e fica em memória; é renovado sozinho quando está perto de
+vencer, e um `401` no meio do caminho renova e tenta de novo uma vez, em vez de
+contar falha na assinatura. As duas variáveis valem juntas: com só uma delas
+preenchida, o boot reclama, porque o mais provável é alguém ter parado no meio
+do cadastro.
+
+Sem as credenciais, todo o resto dos alertas continua funcionando — só o
+`/alerta twitch` responde explicando o que falta.
+
 ### Mangá: um alerta por capítulo, não por upload
 
 O mesmo capítulo existe várias vezes no MangaDex: um upload por idioma e por
@@ -217,10 +266,18 @@ Embed com título, link, thumbnail quando houver, nome da fonte e cor por tipo.
 Mais de três itens novos de uma vez viram **um** embed com a lista, em vez de uma
 enxurrada de embeds.
 
-O cargo a mencionar é opcional e por assinatura. Como o bot roda com
-`allowed_mentions=none()` globalmente, o ping só funciona porque o envio passa um
-`AllowedMentions(roles=[cargo])` explícito — com `everyone` e `users` desligados,
-para liberar exatamente aquele cargo e nada mais.
+O cargo a mencionar é opcional e por assinatura, e o `@everyone` é uma opção à
+parte (hoje exposta no `/alerta twitch`). Como o bot roda com
+`allowed_mentions=none()` globalmente, o ping só funciona porque o envio libera
+explicitamente o que foi pedido — e **só** o que foi pedido: menção de usuário
+nunca entra, em nenhuma combinação.
+
+| Assinatura | Conteúdo | Liberado |
+| --- | --- | --- |
+| cargo | `<@&123>` | `roles: [123]` |
+| everyone | `@everyone` | `parse: ["everyone"]` |
+| os dois | `@everyone <@&123>` | `roles: [123]`, `parse: ["everyone"]` |
+| nenhum | (vazio) | nada |
 
 **Nada é marcado como visto sem ter sido entregue.** `notificar()` devolve uma
 `Entrega` com os itens que realmente saíram, e só esses entram na lista de
@@ -240,10 +297,15 @@ entrega é adiada.
 
 ### Agendamento e resiliência
 
-Um `tasks.loop` de 5 minutos procura assinaturas vencidas (no máximo 12 por tick).
-Cada tipo tem seu intervalo mínimo — YouTube 10 min, MangaDex 15, AniList 10,
-RSS 15 — e a próxima checagem ganha até 20% de folga aleatória, para as
-assinaturas não convergirem todas para o mesmo minuto.
+Um `tasks.loop` de 1 minuto procura assinaturas vencidas (no máximo 12 por tick).
+Cada tipo tem seu intervalo mínimo — Twitch 2 min, YouTube 10, AniList 10,
+MangaDex 15, RSS 15 — e a próxima checagem ganha até 20% de folga aleatória, para
+as assinaturas não convergirem todas para o mesmo minuto.
+
+O tique é o piso da pontualidade de qualquer alerta: com tique de 5 minutos, uma
+live demoraria isso para ser percebida mesmo com o intervalo da Twitch em 2
+minutos. O tique em si é barato — quase sempre é uma consulta ao banco que não
+devolve nada.
 
 Uma fonte que falha nunca derruba o laço: a falha é contada na assinatura e a
 espera dobra a cada tropeço, até o teto de 6 horas (`calcular_backoff`). A partir
